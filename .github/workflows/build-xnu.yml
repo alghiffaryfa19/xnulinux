@@ -287,6 +287,26 @@ jobs:
           # Build mkapfs on macOS (patch Linux-only <linux/fs.h> BLKGETSIZE64 to macOS <sys/disk.h> DKIOCGETBLOCKCOUNT)
           git clone -q https://github.com/linux-apfs/apfsprogs.git "$WORK/dvm/sources/apfsprogs"
           git -C "$WORK/dvm/sources/apfsprogs" checkout -q 1bd1c1c2140d13d1b6d2e03379316572bee70aa3
+
+          # macOS has no <linux/types.h>; apfsprogs only needs the endian typedefs from it
+          mkdir -p "$WORK/shim/linux"
+          cat > "$WORK/shim/linux/types.h" <<'EOF'
+          #ifndef _SHIM_LINUX_TYPES_H
+          #define _SHIM_LINUX_TYPES_H
+          #include <stdint.h>
+          typedef uint8_t  __u8;
+          typedef uint16_t __u16;
+          typedef uint32_t __u32;
+          typedef uint64_t __u64;
+          typedef uint16_t __le16;
+          typedef uint32_t __le32;
+          typedef uint64_t __le64;
+          typedef uint16_t __be16;
+          typedef uint32_t __be32;
+          typedef uint64_t __be64;
+          #endif
+          EOF
+
           python3 - "$WORK/dvm/sources/apfsprogs/mkapfs/mkapfs.c" <<'PY'
           import pathlib, sys
           p = pathlib.Path(sys.argv[1])
@@ -295,7 +315,8 @@ jobs:
           s = s.replace('ioctl(fd, BLKGETSIZE64, &size)', '0')
           p.write_text(s)
           PY
-          make -C "$WORK/dvm/sources/apfsprogs/mkapfs" CC=/usr/bin/clang CFLAGS="-O2 -Wall -I../include"
+          
+          make -C "$WORK/dvm/sources/apfsprogs/mkapfs" CC=/usr/bin/clang CFLAGS="-O2 -Wall -I../include -I$WORK/shim"
 
           # Patch apfs-add-volumes.py on macOS so it runs under sudo directly without Linux 'unshare -r'
           python3 - "$WORK/dvm/scripts/apfs-add-volumes.py" <<'PY'
