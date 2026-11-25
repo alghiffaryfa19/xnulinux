@@ -246,50 +246,43 @@ jobs:
           APPOS_DMG=$(ls "$WORK/raw"/141-64745-*.dmg)
 
           decrypt_aea "$SYSOS_AEA" "$WORK/raw/systemos.dmg"
-          decrypt_aea "$OS_AEA" "$WORK/raw/os.dmg"
+          decrypt_aea "$OS_AEA" "$WORK/apfs.raw"
           df -h "$WORK"
 
-          # 4. Expand IPSW os.dmg (UDIF GPT + sealed System volume with native firmlinks), grow APFS container to DISK_GB,
-          #    and add Data (grouped with System), Preboot, VM, Update, Hardware, and xART roles offline via apfs-add-volumes.py
-          brew list lzfse >/dev/null 2>&1 || brew install lzfse
-          export DYLD_FALLBACK_LIBRARY_PATH="/opt/homebrew/lib:/usr/local/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
-          echo "Expanding $WORK/raw/os.dmg into sparse raw disk $WORK/os.disk.raw..."
-          python3 "$WORK/dvm/scripts/udif-expand.py" "$WORK/raw/os.dmg" "$WORK/os.disk.raw"
-          rm -f "$WORK/raw/os.dmg"
-
-          # Extract the APFS container partition from os.disk.raw into $WORK/apfs.raw
-          python3 - "$WORK/os.disk.raw" "$WORK/apfs.raw" <<'PY'
+          # 4. In macOS 27.2 IPSW, the decrypted OS member (141-64992-076.dmg) is ALREADY a bare APFS container (NXSB at offset 32)
+          #    whose only volume is the System volume ("Macintosh HD", role S, with native firmlinks). Grow it to DISK_GB and add
+          #    Data (grouped with System), Preboot, VM, Update, Hardware, and xART roles offline via apfs-add-volumes.py.
+          #    (If a future IPSW packages it as UDIF or GPT, handle that transparently too.)
+          python3 - "$WORK/apfs.raw" <<'PY'
           import os, struct, subprocess, sys
-          disk_path, apfs_path = sys.argv[1], sys.argv[2]
-          with open(disk_path, 'rb') as f:
-              f.seek(512)
-              hdr = f.read(512)
-              assert hdr[:8] == b'EFI PART', 'not a GPT disk'
-              entries_lba, count, stride = struct.unpack_from('<QII', hdr, 72)
-              f.seek(entries_lba * 512)
-              entries = f.read(count * stride)
-          apfs_part = None
-          for i in range(count):
-              e = entries[i * stride:(i + 1) * stride]
-              if e[:16] == bytes(16):
-                  continue
-              first_lba, last_lba = struct.unpack_from('<QQ', e, 32)
-              with open(disk_path, 'rb') as f:
-                  f.seek(first_lba * 512 + 32)
-                  if f.read(4) == b'NXSB':
-                      apfs_part = (first_lba, last_lba - first_lba + 1)
-                      break
-          assert apfs_part is not None, 'no APFS container partition found in os.dmg'
-          first_lba, num_lbas = apfs_part
-          print(f'Extracting APFS container: LBA {first_lba}, {num_lbas} sectors ({num_lbas * 512 >> 20} MiB)')
-          subprocess.run([
-              'dd', f'if={disk_path}', f'of={apfs_path}', 'bs=1m',
-              f'skip={first_lba * 512}', 'iflag=skip_bytes',
-              f'count={num_lbas * 512}', 'iflag=count_bytes,skip_bytes',
-              'conv=sparse'
-          ], check=True)
+          path = sys.argv[1]
+          with open(path, 'rb') as f:
+              head = f.read(1024)
+          if head[32:36] == b'NXSB':
+              print(f'{path} is already a bare APFS container ({os.path.getsize(path) >> 20} MiB)')
+          elif head[512:520] == b'EFI PART':
+              print(f'{path} is a GPT disk image; extracting APFS container partition...')
+              entries_lba, count, stride = struct.unpack_from('<QII', head, 512 + 72)
+              with open(path, 'rb') as f:
+                  f.seek(entries_lba * 512)
+                  entries = f.read(count * stride)
+              for i in range(count):
+                  e = entries[i * stride:(i + 1) * stride]
+                  if e[:16] == bytes(16):
+                      continue
+                  first_lba, last_lba = struct.unpack_from('<QQ', e, 32)
+                  with open(path, 'rb') as f:
+                      f.seek(first_lba * 512 + 32)
+                      if f.read(4) == b'NXSB':
+                          tmp = path + '.part'
+                          subprocess.run(['dd', f'if={path}', f'of={tmp}', 'bs=1m',
+                              f'skip={first_lba * 512}', f'count={(last_lba - first_lba + 1) * 512}',
+                              'iflag=skip_bytes,count_bytes', 'conv=sparse'], check=True)
+                          os.replace(tmp, path)
+                          break
+          else:
+              raise SystemExit(f'Unsupported OS image header: {head[:64].hex()}')
           PY
-          rm -f "$WORK/os.disk.raw"
 
           # Build mkapfs on macOS (patch Linux-only <linux/fs.h> BLKGETSIZE64 to macOS <sys/disk.h> DKIOCGETBLOCKCOUNT)
           git clone -q https://github.com/linux-apfs/apfsprogs.git "$WORK/dvm/sources/apfsprogs"
