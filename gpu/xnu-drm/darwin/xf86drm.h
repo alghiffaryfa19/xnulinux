@@ -45,10 +45,36 @@ typedef struct _drmDevice {
 } drmDevice, *drmDevicePtr;
 
 int drmIoctl(int fd, unsigned long request, void *arg);
+int drmCommandRead(int fd, unsigned long drmCommandIndex, void *data, unsigned long size);
+int drmCommandWrite(int fd, unsigned long drmCommandIndex, void *data, unsigned long size);
+int drmCommandWriteRead(int fd, unsigned long drmCommandIndex, void *data, unsigned long size);
+int drmGetCap(int fd, uint64_t capability, uint64_t *value);
+int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd);
+int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle);
 int drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max_devices);
 void drmFreeDevices(drmDevicePtr devices[], int count);
 drmVersionPtr drmGetVersion(int fd);
 void drmFreeVersion(drmVersionPtr v);
+
+int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle);
+int drmSyncobjDestroy(int fd, uint32_t handle);
+int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd);
+int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle);
+int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd);
+int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd);
+int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles,
+		   int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled);
+int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t handle_count);
+int drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t handle_count);
+int drmSyncobjTimelineSignal(int fd, const uint32_t *handles,
+			     uint64_t *points, uint32_t handle_count);
+int drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points,
+			   unsigned num_handles, int64_t timeout_nsec,
+			   unsigned flags, uint32_t *first_signaled);
+int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t handle_count);
+int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points, uint32_t handle_count, uint32_t flags);
+int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point,
+		       uint32_t src_handle, uint64_t src_point, uint32_t flags);
 
 #ifdef __cplusplus
 }

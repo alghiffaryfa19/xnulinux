@@ -3686,8 +3686,10 @@ extern "C" id xnu_cpu_metal_open_device(const char *loader, const char *icd_json
     std::string loader = contentsDir.empty() ? "libvulkan.1.dylib" : (contentsDir + "/Frameworks/libvulkan.1.dylib");
     std::string lvpIcd = contentsDir.empty() ? "" : (contentsDir + "/Resources/lvp_icd.aarch64.json");
     std::string venusIcd = contentsDir.empty() ? "" : (contentsDir + "/Resources/virtio_icd.aarch64.json");
+    std::string turnipIcd = contentsDir.empty() ? "" : (contentsDir + "/Resources/freedreno_icd.aarch64.json");
     std::string lvpDylib = contentsDir.empty() ? "" : (contentsDir + "/Frameworks/libvulkan_lvp.dylib");
     std::string venusDylib = contentsDir.empty() ? "" : (contentsDir + "/Frameworks/libvulkan_virtio.dylib");
+    std::string turnipDylib = contentsDir.empty() ? "" : (contentsDir + "/Frameworks/libvulkan_freedreno.dylib");
 
     // The overrides name code to load into the process: never honoured where the environment is not the process's own
     // (set-id programs), as dyld ignores DYLD_* there.
@@ -3698,6 +3700,7 @@ extern "C" id xnu_cpu_metal_open_device(const char *loader, const char *icd_json
     const char *envIcd = xcmEnv("XNU_CPU_METAL_ICD");
     const char *envBackend = xcmEnv("XNU_CPU_METAL_BACKEND");
 
+    bool useTurnip = false;
     bool useVenus = false;
     bool forcedBackend = false;
     bool customDriver = (envDriver && envDriver[0]) || (envIcd && envIcd[0]);
@@ -3711,10 +3714,14 @@ extern "C" id xnu_cpu_metal_open_device(const char *loader, const char *icd_json
         // (works in secure mode and avoids scanning icd.d). Multi-ICD colon lists fall back to env.
         directDylib = xcmResolveIcdLibraryPath(icdJson);
     } else {
-        if (envBackend && strcasecmp(envBackend, "venus") == 0) {
+        if (envBackend && (strcasecmp(envBackend, "turnip") == 0 || strcasecmp(envBackend, "freedreno") == 0 || strcasecmp(envBackend, "adreno") == 0)) {
+            useTurnip = true;
+            forcedBackend = true;
+        } else if (envBackend && strcasecmp(envBackend, "venus") == 0) {
             useVenus = true;
             forcedBackend = true;
         } else if (envBackend && strcasecmp(envBackend, "lavapipe") == 0) {
+            useTurnip = false;
             useVenus = false;
             forcedBackend = true;
         } else {
@@ -3722,16 +3729,24 @@ extern "C" id xnu_cpu_metal_open_device(const char *loader, const char *icd_json
             if (drmSvc) {
                 IOObjectRelease(drmSvc);
                 struct stat st = {};
-                if (!venusDylib.empty() && stat(venusDylib.c_str(), &st) == 0) useVenus = true;
+                if (!turnipDylib.empty() && stat(turnipDylib.c_str(), &st) == 0) {
+                    useTurnip = true;
+                } else if (!venusDylib.empty() && stat(venusDylib.c_str(), &st) == 0) {
+                    useVenus = true;
+                }
             }
         }
-        directDylib = useVenus ? venusDylib : lvpDylib;
-        icdJson = useVenus ? venusIcd : lvpIcd;
+        directDylib = useTurnip ? turnipDylib : (useVenus ? venusDylib : lvpDylib);
+        icdJson = useTurnip ? turnipIcd : (useVenus ? venusIcd : lvpIcd);
     }
 
     // IOSurfaces read/written by this Metal device must be linear uncompressed rows (WindowServer/QuartzCore).
     // Use in-memory NSRegistrationDomain (never persisted to any app's plist on disk).
-    [[NSUserDefaults standardUserDefaults] registerDefaults:@{@"CAEnableIOSurfaceCompression": @NO}];
+    [[NSUserDefaults standardUserDefaults] registerDefaults:@{
+        @"CAEnableIOSurfaceCompression": @NO,
+        @"CAEnableFramebufferCompression": @NO,
+    }];
+    setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 0);
 
     char cacheDir[512] = {};
     auto tryCacheDir = [&](const char *path) -> bool {
@@ -3804,15 +3819,24 @@ extern "C" id xnu_cpu_metal_open_device(const char *loader, const char *icd_json
         }
     };
 
-    if (!customDriver && !useVenus) configureLavapipeEnv();
+    if (!customDriver && !useTurnip && !useVenus) configureLavapipeEnv();
 
     void *directPfn = directDylib.empty() ? nullptr : xcmLoadDirectDriver(directDylib);
     id dev = nil;
     if (directPfn || !icdJson.empty()) {
         dev = xnu_cpu_metal_open_device_direct(loader.c_str(), directPfn, icdJson.c_str(), cacheDir, port);
     }
-    if (!dev && useVenus && !forcedBackend && !customDriver && !lvpDylib.empty()) {
-        os_log_error(OS_LOG_DEFAULT, "XnuCpuMetal: Venus backend open failed (%{public}s), falling back to lavapipe",
+    if (!dev && useTurnip && !forcedBackend && !customDriver && !venusDylib.empty()) {
+        struct stat st = {};
+        if (stat(venusDylib.c_str(), &st) == 0) {
+            os_log_error(OS_LOG_DEFAULT, "XnuCpuMetal: Turnip backend open failed (%{public}s), trying Venus",
+                         xm2v_last_error() ?: "?");
+            void *venusPfn = xcmLoadDirectDriver(venusDylib);
+            dev = xnu_cpu_metal_open_device_direct(loader.c_str(), venusPfn, venusIcd.c_str(), cacheDir, port);
+        }
+    }
+    if (!dev && (useTurnip || useVenus) && !forcedBackend && !customDriver && !lvpDylib.empty()) {
+        os_log_error(OS_LOG_DEFAULT, "XnuCpuMetal: DRM GPU backend open failed (%{public}s), falling back to lavapipe",
                      xm2v_last_error() ?: "?");
         configureLavapipeEnv();
         void *lvpPfn = xcmLoadDirectDriver(lvpDylib);
@@ -3822,3 +3846,15 @@ extern "C" id xnu_cpu_metal_open_device(const char *loader, const char *icd_json
 }
 
 @end
+
+// Kernel boot-arg ca-triple-buffer=1 enables WindowServer's CA_FORCE_TRIPLE_BUFFERED_LATENCY (QuartzCore debug option 198)
+// so CoreAnimation renders a frame ahead on high-refresh-rate panels (such as Xiaomi Pad 6S Pro's 120 Hz display).
+__attribute__((constructor)) static void xcmTripleBufferFromBootArgs() {
+    char args[1024] = {};
+    size_t size = sizeof(args) - 1;
+    if (strcmp(getprogname(), "WindowServer") || sysctlbyname("kern.bootargs", args, &size, nullptr, 0) ||
+        !strstr(args, "ca-triple-buffer=1")) return;
+    auto setOption = reinterpret_cast<void (*)(unsigned, bool)>(dlsym(RTLD_DEFAULT, "CASetDebugOption"));
+    if (setOption) setOption(198, true);
+}
+

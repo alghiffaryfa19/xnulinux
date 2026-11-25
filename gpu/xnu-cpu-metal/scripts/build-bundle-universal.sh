@@ -37,6 +37,15 @@ if [ -f "$VENUS_DYLIB" ]; then
   HAS_VENUS=1
 fi
 
+TURNIP_DYLIB="${TURNIP_DYLIB:-$HOME/w/turnip-darwin/out/lib/libvulkan_freedreno.dylib}"	# gpu/turnip/build-darwin.sh output
+HAS_TURNIP=0
+if [ -f "$TURNIP_DYLIB" ]; then
+  cp -f "$TURNIP_DYLIB" "$BUNDLE/Contents/Frameworks/libvulkan_freedreno.dylib"
+  chmod u+w "$BUNDLE/Contents/Frameworks/libvulkan_freedreno.dylib"
+  install_name_tool -id "@rpath/libvulkan_freedreno.dylib" "$BUNDLE/Contents/Frameworks/libvulkan_freedreno.dylib"
+  HAS_TURNIP=1
+fi
+
 # 2. Relocatable ICD JSONs (both top-level for env-var/backend selection and vulkan/icd.d/ for secure-mode SYSCONFDIR)
 cat > "$BUNDLE/Contents/Resources/lvp_icd.aarch64.json" <<'EOF'
 {
@@ -81,6 +90,28 @@ EOF
 }
 EOF
 fi
+if [ "$HAS_TURNIP" = "1" ]; then
+  cat > "$BUNDLE/Contents/Resources/freedreno_icd.aarch64.json" <<'EOF'
+{
+    "ICD": {
+        "api_version": "1.4.363",
+        "library_arch": "64",
+        "library_path": "../Frameworks/libvulkan_freedreno.dylib"
+    },
+    "file_format_version": "1.0.1"
+}
+EOF
+  cat > "$BUNDLE/Contents/Resources/vulkan/icd.d/freedreno_icd.aarch64.json" <<'EOF'
+{
+    "ICD": {
+        "api_version": "1.4.363",
+        "library_arch": "64",
+        "library_path": "../../../Frameworks/libvulkan_freedreno.dylib"
+    },
+    "file_format_version": "1.0.1"
+}
+EOF
+fi
 
 # 3. Compile XnuCpuMetal MH_BUNDLE for both arm64 and arm64e, then lipo
 for ARCH in arm64 arm64e; do
@@ -110,6 +141,9 @@ codesign -s - --force "$BUNDLE/Contents/Frameworks/libvulkan_lvp.dylib"
 if [ "$HAS_VENUS" = "1" ]; then
   codesign -s - --force "$BUNDLE/Contents/Frameworks/libvulkan_virtio.dylib"
 fi
+if [ "$HAS_TURNIP" = "1" ]; then
+  codesign -s - --force "$BUNDLE/Contents/Frameworks/libvulkan_freedreno.dylib"
+fi
 codesign -s - --force "$BUNDLE/Contents/MacOS/XnuCpuMetal"
 
 echo "=== Built universal (arm64 + arm64e) $BUNDLE ==="
@@ -122,5 +156,8 @@ for f in \
 done
 if [ "$HAS_VENUS" = "1" ]; then
   lipo -info "$BUNDLE/Contents/Frameworks/libvulkan_virtio.dylib"
+fi
+if [ "$HAS_TURNIP" = "1" ]; then
+  lipo -info "$BUNDLE/Contents/Frameworks/libvulkan_freedreno.dylib"
 fi
 ls -lh "$BUNDLE/Contents/MacOS/" "$BUNDLE/Contents/Frameworks/"

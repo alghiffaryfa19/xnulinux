@@ -1,0 +1,80 @@
+Upstream: Mesa 26.3.1 (https://archive.mesa3d.org/mesa-26.3.1.tar.xz)
+Upstream-License: MIT
+Patch-License: MIT (provided under the same license as upstream)
+Subject: turnip: the msm DRM renderer on macOS over the xnulinux DRM bridge
+
+In the hosted macOS of xnulinux on Qualcomm Snapdragon / Adreno platforms (such as Xiaomi Pad 6S Pro / SM8550 Adreno 740),
+the GPU is the Linux host's msm DRM render node (/dev/dri/renderD128), reached through kexts/XnuDrm and xnudrmd.
+gpu/xnu-drm/darwin (libxnudrm: xf86drm.h, the render node's open/mmap/poll and DRM syncobj helpers) is copied to
+src/freedreno/vulkan/xnudrm by the build (gpu/turnip/build-darwin.sh) and compiled into libvulkan_freedreno.dylib.
+VK_EXT_map_memory_placed is disabled because XnuDrm maps Linux GEM pages at kernel-chosen addresses.
+
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -137,6 +137,24 @@
+   tu_flags += '-DTU_HAS_MSM'
+   libtu_files += files('tu_knl_drm_msm.cc', 'tu_knl_drm.cc')
+   tu_deps += dep_libdrm
++  if host_machine.system() == 'darwin'
++    libtu_files += files(
++      'xnudrm/xnudrm.c',
++      '../../util/u_sync_provider.c',
++      '../../vulkan/runtime/vk_drm_syncobj.c',
++    )
++    libtu_includes += include_directories('xnudrm')
++    tu_flags += [
++      '-DTU_XNUDRM',
++      '-DHAVE_LIBDRM',
++      '-DMAJOR_IN_SYSMACROS=0',
++      '-include', meson.current_source_dir() / 'xnudrm' / 'xnudrm_compat.h',
++    ]
++    vulkan_icd_link_args += [
++      '-framework', 'IOKit', '-framework', 'CoreFoundation',
++      '-Wl,-undefined,dynamic_lookup', '-Wl,-dead_strip',
++    ]
++  endif
+ endif
+ 
+ if freedreno_kmds.contains('virtio')
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -370,7 +370,11 @@
+       .EXT_legacy_vertex_attributes = true,
+       .EXT_line_rasterization = true,
+       .EXT_load_store_op_none = true,
++#ifdef TU_XNUDRM
++      .EXT_map_memory_placed = false,
++#else
+       .EXT_map_memory_placed = true,
++#endif
+       .EXT_memory_budget = true,
+       .EXT_multi_draw = true,
+       .EXT_multisampled_render_to_single_sampled = true,
+@@ -802,9 +806,15 @@
+    features->legacyDithering = true;
+ 
+    /* VK_EXT_map_memory_placed */
++#ifdef TU_XNUDRM
++   features->memoryMapPlaced = false;
++   features->memoryMapRangePlaced = false;
++   features->memoryUnmapReserve = false;
++#else
+    features->memoryMapPlaced = true;
+    features->memoryMapRangePlaced = false;
+    features->memoryUnmapReserve = true;
++#endif
+ 
+    /* VK_EXT_multi_draw */
+    features->multiDraw = true;
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -15,6 +15,9 @@
+ #ifdef MAJOR_IN_SYSMACROS
+ #include <sys/sysmacros.h>
+ #endif
++#ifdef __APPLE__
++#include <sys/types.h>
++#endif
+ 
+ #include <sys/mman.h>
+ 

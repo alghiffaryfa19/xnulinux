@@ -17,7 +17,7 @@ on:
         type: boolean
         default: true
       build_gpu_bundle:
-        description: "Build universal (arm64 + arm64e) XnuCpuMetal.bundle (Lavapipe + metal2vulkan + Venus)"
+        description: "Build universal (arm64 + arm64e) XnuCpuMetal.bundle (Turnip Adreno 740 + Lavapipe + Venus + metal2vulkan)"
         type: boolean
         default: true
       build_kernel:
@@ -89,8 +89,9 @@ jobs:
         if: ${{ inputs.build_gpu_bundle }}
         uses: actions/cache/restore@v4
         with:
-          key: xnulinux-gpu-v1-${{ runner.os }}-${{ hashFiles('gpu/xnu-cpu-metal/scripts/**', 'gpu/xnu-cpu-metal/patches/**') }}
+          key: xnulinux-gpu-v2-${{ runner.os }}-${{ hashFiles('gpu/xnu-cpu-metal/scripts/**', 'gpu/xnu-cpu-metal/patches/**', 'gpu/turnip/**', 'gpu/xnu-drm/**') }}
           restore-keys: |
+            xnulinux-gpu-v2-${{ runner.os }}-
             xnulinux-gpu-v1-${{ runner.os }}-
           path: |
             gpu/xnu-cpu-metal/build/llvm-arm64e-install
@@ -99,7 +100,9 @@ jobs:
       - name: Build universal XnuCpuMetal.bundle (arm64 + arm64e)
         if: ${{ inputs.build_gpu_bundle }}
         run: |
-          # 1. Build Venus Darwin driver (libvulkan_virtio.dylib)
+          # 1. Build Turnip Adreno Darwin driver (libvulkan_freedreno.dylib) & Venus Darwin driver (libvulkan_virtio.dylib)
+          bash gpu/turnip/build-darwin.sh
+          export TURNIP_DYLIB="$HOME/w/turnip-darwin/out/lib/libvulkan_freedreno.dylib"
           bash gpu/venus/build-darwin.sh
           export VENUS_DYLIB="$HOME/w/venus-darwin/out/lib/libvulkan_virtio.dylib"
 
@@ -131,7 +134,7 @@ jobs:
         if: ${{ inputs.build_gpu_bundle && steps.gpu-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
-          key: xnulinux-gpu-v1-${{ runner.os }}-${{ hashFiles('gpu/xnu-cpu-metal/scripts/**', 'gpu/xnu-cpu-metal/patches/**') }}
+          key: xnulinux-gpu-v2-${{ runner.os }}-${{ hashFiles('gpu/xnu-cpu-metal/scripts/**', 'gpu/xnu-cpu-metal/patches/**', 'gpu/turnip/**', 'gpu/xnu-drm/**') }}
           path: |
             gpu/xnu-cpu-metal/build/llvm-arm64e-install
             gpu/xnu-cpu-metal/dist
