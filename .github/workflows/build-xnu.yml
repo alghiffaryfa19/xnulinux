@@ -256,9 +256,17 @@ jobs:
           DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" | awk 'NR==1{print $1}')
           diskutil partitionDisk "$DEV" GPT APFS "Macintosh HD" 100%
           sleep 3
-          CONTAINER=$(diskutil list "$DEV" | awk '/Apple_APFS/{print $NF; exit}')
-          APFS_CONT=$(diskutil apfs list "$CONTAINER" | awk '/Container Reference/{print $NF; exit}')
+          PHYS_STORE="$(basename "$DEV")s2"
+          APFS_CONT=$(diskutil list "$DEV" | awk '/Apple_APFS/{for(i=1;i<=NF;i++) if($i=="Container" && $(i+1)~ /^disk[0-9]+$/) {print $(i+1); exit}}')
+          if [ -z "$APFS_CONT" ]; then
+            APFS_CONT=$(diskutil apfs list | awk -v ps="$PHYS_STORE" '
+              /Container Reference:/ { c=$NF }
+              /APFS Physical Store/ && $0 ~ ps { print c; exit }
+            ')
+          fi
+          diskutil unmountDisk "$APFS_CONT" >/dev/null 2>&1 || true
           SYS_DEV=$(diskutil list "$APFS_CONT" | awk '/Macintosh HD/{print $NF; exit}')
+          echo "Attached $DEV (store $PHYS_STORE) -> APFS container $APFS_CONT, System volume $SYS_DEV"
 
           # Create volume group with Data, plus Preboot, VM, Update, Hardware, xART roles
           diskutil apfs addVolume "$APFS_CONT" APFS "Data" -role D -groupWith "$SYS_DEV" -nomount
@@ -268,8 +276,11 @@ jobs:
           diskutil apfs addVolume "$APFS_CONT" APFS "Hardware" -role H -nomount
           diskutil apfs addVolume "$APFS_CONT" APFS "xART" -role X -nomount
 
-          DATA_DEV=$(diskutil list "$APFS_CONT" | awk '/ Data /{print $NF; exit}')
-          PRE_DEV=$(diskutil list "$APFS_CONT" | awk '/ Preboot /{print $NF; exit}')
+          DATA_DEV=$(diskutil list "$APFS_CONT" | awk '/APFS Volume Data /{print $NF; exit}')
+          [ -n "$DATA_DEV" ] || DATA_DEV=$(diskutil list "$APFS_CONT" | awk '/ Data /{print $NF; exit}')
+          PRE_DEV=$(diskutil list "$APFS_CONT" | awk '/APFS Volume Preboot /{print $NF; exit}')
+          [ -n "$PRE_DEV" ] || PRE_DEV=$(diskutil list "$APFS_CONT" | awk '/ Preboot /{print $NF; exit}')
+          echo "APFS volumes: System=$SYS_DEV Data=$DATA_DEV Preboot=$PRE_DEV"
 
           mkdir -p "$WORK/mnt/sys" "$WORK/mnt/data" "$WORK/mnt/preboot" "$WORK/mnt/os_src" "$WORK/mnt/sysos_src" "$WORK/mnt/appos_src"
           sudo mount -t apfs -o rw,nobrowse "/dev/$SYS_DEV" "$WORK/mnt/sys"
