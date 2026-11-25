@@ -249,16 +249,125 @@ jobs:
           decrypt_aea "$OS_AEA" "$WORK/raw/os.dmg"
           df -h "$WORK"
 
-          # 4. Create sparse raw GPT + APFS container disk image (mac.img) and populate System, Data, Preboot
+          # 4. Expand IPSW os.dmg (UDIF GPT + sealed System volume with native firmlinks), grow APFS container to DISK_GB,
+          #    and add Data (grouped with System), Preboot, VM, Update, Hardware, and xART roles offline via apfs-add-volumes.py
+          brew list lzfse >/dev/null 2>&1 || brew install lzfse
+          export DYLD_FALLBACK_LIBRARY_PATH="/opt/homebrew/lib:/usr/local/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
+          echo "Expanding $WORK/raw/os.dmg into sparse raw disk $WORK/os.disk.raw..."
+          python3 "$WORK/dvm/scripts/udif-expand.py" "$WORK/raw/os.dmg" "$WORK/os.disk.raw"
+          rm -f "$WORK/raw/os.dmg"
+
+          # Extract the APFS container partition from os.disk.raw into $WORK/apfs.raw
+          python3 - "$WORK/os.disk.raw" "$WORK/apfs.raw" <<'PY'
+          import os, struct, subprocess, sys
+          disk_path, apfs_path = sys.argv[1], sys.argv[2]
+          with open(disk_path, 'rb') as f:
+              f.seek(512)
+              hdr = f.read(512)
+              assert hdr[:8] == b'EFI PART', 'not a GPT disk'
+              entries_lba, count, stride = struct.unpack_from('<QII', hdr, 72)
+              f.seek(entries_lba * 512)
+              entries = f.read(count * stride)
+          apfs_part = None
+          for i in range(count):
+              e = entries[i * stride:(i + 1) * stride]
+              if e[:16] == bytes(16):
+                  continue
+              first_lba, last_lba = struct.unpack_from('<QQ', e, 32)
+              with open(disk_path, 'rb') as f:
+                  f.seek(first_lba * 512 + 32)
+                  if f.read(4) == b'NXSB':
+                      apfs_part = (first_lba, last_lba - first_lba + 1)
+                      break
+          assert apfs_part is not None, 'no APFS container partition found in os.dmg'
+          first_lba, num_lbas = apfs_part
+          print(f'Extracting APFS container: LBA {first_lba}, {num_lbas} sectors ({num_lbas * 512 >> 20} MiB)')
+          subprocess.run([
+              'dd', f'if={disk_path}', f'of={apfs_path}', 'bs=1m',
+              f'skip={first_lba * 512}', 'iflag=skip_bytes',
+              f'count={num_lbas * 512}', 'iflag=count_bytes,skip_bytes',
+              'conv=sparse'
+          ], check=True)
+          PY
+          rm -f "$WORK/os.disk.raw"
+
+          # Build mkapfs on macOS (patch Linux-only <linux/fs.h> BLKGETSIZE64 to macOS <sys/disk.h> DKIOCGETBLOCKCOUNT)
+          git clone -q https://github.com/linux-apfs/apfsprogs.git "$WORK/dvm/sources/apfsprogs"
+          git -C "$WORK/dvm/sources/apfsprogs" checkout -q 1bd1c1c2140d13d1b6d2e03379316572bee70aa3
+          python3 - "$WORK/dvm/sources/apfsprogs/mkapfs/mkapfs.c" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          s = s.replace('#include <linux/fs.h>', '#ifdef __APPLE__\n#include <sys/disk.h>\n#else\n#include <linux/fs.h>\n#endif')
+          s = s.replace('ioctl(fd, BLKGETSIZE64, &size)', '0')
+          p.write_text(s)
+          PY
+          make -C "$WORK/dvm/sources/apfsprogs/mkapfs" CC=/usr/bin/clang CFLAGS="-O2 -Wall -I../include"
+
+          # Patch apfs-add-volumes.py on macOS so it runs under sudo directly without Linux 'unshare -r'
+          python3 - "$WORK/dvm/scripts/apfs-add-volumes.py" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          p.write_text(p.read_text().replace("['unshare', '-r', str(MKAPFS),", "[str(MKAPFS),"))
+          PY
+
+          GROW_BYTES=$(python3 -c "print((int('$DISK_GB') * 1024 * 1024 * 1024) - (64 * 1024 * 1024))")
+          sudo python3 "$WORK/dvm/scripts/apfs-add-volumes.py" info "$WORK/apfs.raw"
+          sudo python3 "$WORK/dvm/scripts/apfs-add-volumes.py" add "$WORK/apfs.raw" \
+            --grow-to "$GROW_BYTES" \
+            --group-with 0 \
+            Data:D Preboot:B VM:V Update:E Hardware:H xART:X
+          sudo python3 "$WORK/dvm/scripts/apfs-add-volumes.py" info "$WORK/apfs.raw"
+
+          # Wrap the grown APFS container inside a GPT disk image ($IMG) with partition 1 at 1 MiB (LBA 2048)
           IMG="$WORK/mac.img"
           rm -f "$IMG"
-          python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_CREAT|os.O_TRUNC|os.O_WRONLY, 0o644); os.ftruncate(fd, int(sys.argv[2])*1024*1024*1024); os.close(fd)' "$IMG" "$DISK_GB"
+          python3 - "$IMG" "$DISK_GB" "$GROW_BYTES" <<'PY'
+          import os, struct, uuid, zlib, sys
+          img_path, disk_gb, part_bytes = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+          total_bytes = disk_gb * 1024 * 1024 * 1024
+          total_lbas = total_bytes // 512
+          part_start_lba = 2048
+          part_end_lba = part_start_lba + (part_bytes // 512) - 1
+          fd = os.open(img_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
+          os.ftruncate(fd, total_bytes)
+          # Protective MBR at LBA 0
+          mbr = bytearray(512)
+          mbr[446:446+16] = struct.pack('<BBBBBBBBII', 0, 0, 2, 0, 0xEE, 0xFF, 0xFF, 0xFF, 1, min(total_lbas - 1, 0xFFFFFFFF))
+          mbr[510:512] = b'\x55\xAA'
+          os.pwrite(fd, mbr, 0)
+          # GPT Partition Entry 0: Apple_APFS_ISC (69646961-6700-11AA-AA11-00306543ECAC)
+          apfs_isc_guid = uuid.UUID('69646961-6700-11AA-AA11-00306543ECAC').bytes_le
+          unique_guid = uuid.uuid4().bytes_le
+          name_utf16 = 'Apple_APFS_ISC'.encode('utf-16le').ljust(72, b'\x00')
+          entry0 = struct.pack('<16s16sQQQ72s', apfs_isc_guid, unique_guid, part_start_lba, part_end_lba, 0, name_utf16)
+          entries = entry0 + bytes(127 * 128)
+          entries_crc = zlib.crc32(entries) & 0xFFFFFFFF
+          disk_guid = uuid.uuid4().bytes_le
+          def make_gpt_hdr(my_lba, alt_lba, entries_lba):
+              hdr = bytearray(92)
+              struct.pack_into('<8sIIIIQQQQ16sQIII', hdr, 0,
+                  b'EFI PART', 0x00010000, 92, 0, 0,
+                  my_lba, alt_lba, 34, total_lbas - 34,
+                  disk_guid, entries_lba, 128, 128, entries_crc)
+              crc = zlib.crc32(hdr) & 0xFFFFFFFF
+              struct.pack_into('<I', hdr, 16, crc)
+              return bytes(hdr).ljust(512, b'\x00')
+          os.pwrite(fd, make_gpt_hdr(1, total_lbas - 1, 2), 512)
+          os.pwrite(fd, entries, 2 * 512)
+          os.pwrite(fd, entries, (total_lbas - 33) * 512)
+          os.pwrite(fd, make_gpt_hdr(total_lbas - 1, 1, total_lbas - 33), (total_lbas - 1) * 512)
+          os.close(fd)
+          PY
+          dd if="$WORK/apfs.raw" of="$IMG" bs=1m seek=1 conv=notrunc,sparse
+          rm -f "$WORK/apfs.raw"
+
           DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" | awk 'NR==1{print $1}')
-          diskutil partitionDisk "$DEV" GPT APFS "Macintosh HD" 100%
           sleep 3
-          PHYS_STORE="$(basename "$DEV")s2"
+          diskutil list "$DEV"
           APFS_CONT=$(diskutil list "$DEV" | awk '/Apple_APFS/{for(i=1;i<=NF;i++) if($i=="Container" && $(i+1)~ /^disk[0-9]+$/) {print $(i+1); exit}}')
           if [ -z "$APFS_CONT" ]; then
+            PHYS_STORE="$(basename "$DEV")s1"
             APFS_CONT=$(diskutil apfs list | awk -v ps="$PHYS_STORE" '
               /Container Reference:/ { c=$NF }
               /APFS Physical Store/ && $0 ~ ps { print c; exit }
@@ -266,35 +375,18 @@ jobs:
           fi
           diskutil unmountDisk "$APFS_CONT" >/dev/null 2>&1 || true
           SYS_DEV=$(diskutil list "$APFS_CONT" | awk '/Macintosh HD/{print $NF; exit}')
-          echo "Attached $DEV (store $PHYS_STORE) -> APFS container $APFS_CONT, System volume $SYS_DEV"
-
-          # Create volume group with Data, plus Preboot, VM, Update, Hardware, xART roles
-          diskutil apfs addVolume "$APFS_CONT" APFS "Data" -role D -groupWith "$SYS_DEV" -nomount
-          diskutil apfs addVolume "$APFS_CONT" APFS "Preboot" -role B -nomount
-          diskutil apfs addVolume "$APFS_CONT" APFS "VM" -role V -nomount
-          diskutil apfs addVolume "$APFS_CONT" APFS "Update" -role E -nomount
-          diskutil apfs addVolume "$APFS_CONT" APFS "Hardware" -role H -nomount
-          diskutil apfs addVolume "$APFS_CONT" APFS "xART" -role X -nomount
-
           DATA_DEV=$(diskutil list "$APFS_CONT" | awk '/APFS Volume Data /{print $NF; exit}')
           [ -n "$DATA_DEV" ] || DATA_DEV=$(diskutil list "$APFS_CONT" | awk '/ Data /{print $NF; exit}')
           PRE_DEV=$(diskutil list "$APFS_CONT" | awk '/APFS Volume Preboot /{print $NF; exit}')
           [ -n "$PRE_DEV" ] || PRE_DEV=$(diskutil list "$APFS_CONT" | awk '/ Preboot /{print $NF; exit}')
-          echo "APFS volumes: System=$SYS_DEV Data=$DATA_DEV Preboot=$PRE_DEV"
+          echo "APFS volumes on $APFS_CONT: System=$SYS_DEV Data=$DATA_DEV Preboot=$PRE_DEV"
 
-          mkdir -p "$WORK/mnt/sys" "$WORK/mnt/data" "$WORK/mnt/preboot" "$WORK/mnt/os_src" "$WORK/mnt/sysos_src" "$WORK/mnt/appos_src"
+          mkdir -p "$WORK/mnt/sys" "$WORK/mnt/data" "$WORK/mnt/preboot" "$WORK/mnt/sysos_src" "$WORK/mnt/appos_src"
           sudo mount -t apfs -o rw,nobrowse "/dev/$SYS_DEV" "$WORK/mnt/sys"
           sudo diskutil mount -mountPoint "$WORK/mnt/data" "$DATA_DEV"
           sudo diskutil enableOwnership "$WORK/mnt/data"
           sudo diskutil mount -mountPoint "$WORK/mnt/preboot" "$PRE_DEV"
           sudo diskutil enableOwnership "$WORK/mnt/preboot"
-
-          # Attach IPSW OS.dmg, SystemOS.dmg, AppOS.dmg read-only and copy their trees
-          OS_SRC_DEV=$(hdiutil attach -readonly -nobrowse -mountpoint "$WORK/mnt/os_src" "$WORK/raw/os.dmg" | head -1 | awk '{print $1}')
-          echo "Copying base OS volume..."
-          sudo ditto "$WORK/mnt/os_src" "$WORK/mnt/sys"
-          hdiutil detach "$WORK/mnt/os_src" -force
-          rm -f "$WORK/raw/os.dmg"
 
           echo "Merging Cryptex1,SystemOS into System volume and Preboot..."
           hdiutil attach -readonly -nobrowse -mountpoint "$WORK/mnt/sysos_src" "$WORK/raw/systemos.dmg"
