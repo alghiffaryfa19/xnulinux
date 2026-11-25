@@ -189,16 +189,17 @@ jobs:
 
           # 1. Inventory IPSW and fetch only StaticTrustCache, Cryptex1,AppOS, Cryptex1,SystemOS, and OS via HTTP Range
           pushd "$WORK/dvm"
-          python3 scripts/macos-inputs.py --profile configs/macos-27.2-26B8125.json --output "$WORK/inv"
+          python3 scripts/macos-inputs.py --profile configs/macos-27.2-26B8125.json --output inv
           for COMP in StaticTrustCache "Cryptex1,AppOS" "Cryptex1,SystemOS" OS; do
             python3 scripts/macos-fetch-member.py "$COMP" \
               --profile configs/macos-27.2-26B8125.json \
-              --inventory "$WORK/inv/identities.json" \
+              --inventory inv/identities.json \
               --identity k114sap \
-              --output-dir "$WORK/raw" \
+              --output-dir raw \
               --jobs 8
           done
           popd
+          mv "$WORK/dvm/raw" "$WORK/raw"
 
           # 2. Extract raw static trustcache module for xnu.ko trustcache=
           python3 - "$WORK/raw"/*.dmg.aea.trustcache "$WORK/trustcache-mac.bin" <<'PY'
