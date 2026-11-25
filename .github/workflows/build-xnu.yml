@@ -106,6 +106,17 @@ jobs:
           } >> "$GITHUB_PATH"
           xcodebuild -version || xcrun --show-sdk-path
 
+      - name: Restore LLVM arm64e cache
+        id: llvm-cache
+        if: ${{ inputs.build_gpu_bundle }}
+        uses: actions/cache/restore@v4
+        with:
+          key: xnulinux-llvm-arm64e-v1-${{ runner.os }}-${{ hashFiles('gpu/xnu-cpu-metal/scripts/build-llvm-arm64e.sh') }}
+          restore-keys: |
+            xnulinux-llvm-arm64e-v1-${{ runner.os }}-
+          path: |
+            gpu/xnu-cpu-metal/build/llvm-arm64e-install
+
       - name: Restore GPU build cache
         id: gpu-cache
         if: ${{ inputs.build_gpu_bundle }}
@@ -116,7 +127,6 @@ jobs:
             xnulinux-gpu-v2-${{ runner.os }}-
             xnulinux-gpu-v1-${{ runner.os }}-
           path: |
-            gpu/xnu-cpu-metal/build/llvm-arm64e-install
             gpu/xnu-cpu-metal/dist
 
       - name: Build universal XnuCpuMetal.bundle (arm64 + arm64e)
@@ -152,13 +162,20 @@ jobs:
           bash scripts/build-m2v-arm64e.sh
           bash scripts/build-bundle-universal.sh
 
+      - name: Save LLVM arm64e cache
+        if: ${{ inputs.build_gpu_bundle && always() && steps.llvm-cache.outputs.cache-hit != 'true' && hashFiles('gpu/xnu-cpu-metal/build/llvm-arm64e-install/bin/llvm-config') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          key: xnulinux-llvm-arm64e-v1-${{ runner.os }}-${{ hashFiles('gpu/xnu-cpu-metal/scripts/build-llvm-arm64e.sh') }}
+          path: |
+            gpu/xnu-cpu-metal/build/llvm-arm64e-install
+
       - name: Save GPU build cache
         if: ${{ inputs.build_gpu_bundle && steps.gpu-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           key: xnulinux-gpu-v2-${{ runner.os }}-${{ hashFiles('gpu/xnu-cpu-metal/scripts/**', 'gpu/xnu-cpu-metal/patches/**', 'gpu/turnip/**', 'gpu/xnu-drm/**') }}
           path: |
-            gpu/xnu-cpu-metal/build/llvm-arm64e-install
             gpu/xnu-cpu-metal/dist
 
       - name: Build macOS 27.2 APFS disk image (mac.img) from IPSW

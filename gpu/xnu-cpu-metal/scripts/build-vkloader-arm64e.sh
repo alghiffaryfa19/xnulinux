@@ -4,14 +4,24 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VK_HDR_DIR="${VK_HDR_DIR:-$ROOT/build/vk-deps/vulkan-headers/1.4.363.0}"
-if [ ! -d "$VK_HDR_DIR/include/vulkan" ]; then
-  mkdir -p "$VK_HDR_DIR/include"
-  ln -sfn "$ROOT/src/mesa/include/vulkan" "$VK_HDR_DIR/include/vulkan"
-  ln -sfn "$ROOT/src/mesa/include/vk_video" "$VK_HDR_DIR/include/vk_video"
-fi
 BUNDLE_SYSCONFDIR="/Library/GPUBundles/XnuCpuMetal.bundle/Contents/Resources"
 
 export PATH="$ROOT/build/pyvenv/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+if [ ! -f "$VK_HDR_DIR/share/cmake/VulkanHeaders/VulkanHeadersConfig.cmake" ]; then
+  if [ -d "$ROOT/src/Vulkan-Headers" ]; then
+    rm -rf "$ROOT/build/vkheaders"
+    cmake -G Ninja -S "$ROOT/src/Vulkan-Headers" -B "$ROOT/build/vkheaders" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX="$VK_HDR_DIR" \
+      -DVULKAN_HEADERS_ENABLE_TESTS=OFF
+    ninja -C "$ROOT/build/vkheaders" install
+  else
+    mkdir -p "$VK_HDR_DIR/include"
+    ln -sfn "$ROOT/src/mesa/include/vulkan" "$VK_HDR_DIR/include/vulkan"
+    ln -sfn "$ROOT/src/mesa/include/vk_video" "$VK_HDR_DIR/include/vk_video"
+  fi
+fi
 
 build_arch() {
   local ARCH="$1"
@@ -24,6 +34,7 @@ build_arch() {
     -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
     -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+    -DCMAKE_PREFIX_PATH="$VK_HDR_DIR" \
     -DSYSCONFDIR="$BUNDLE_SYSCONFDIR" \
     -DVULKAN_HEADERS_INSTALL_DIR="$VK_HDR_DIR" \
     -DBUILD_TESTS=OFF

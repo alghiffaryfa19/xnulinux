@@ -31,8 +31,9 @@ apply_patches() {   # apply_patches DIR PATCH_SUBDIR
   done
 }
 
-git_at metal2vulkan  https://github.com/steelbrain/metal2vulkan.git   d9236a8a11d3b90a1aa27b54e2d74d3891c4d2e5   # v0.2.0, GPL-2.0-or-later / LGPL-3.0-or-later
-git_at Vulkan-Loader https://github.com/KhronosGroup/Vulkan-Loader.git fa218055ff4948b159f31d43f800c808a13d51df   # vulkan-sdk-1.4.363.0, Apache-2.0
+git_at metal2vulkan   https://github.com/steelbrain/metal2vulkan.git    d9236a8a11d3b90a1aa27b54e2d74d3891c4d2e5   # v0.2.0, GPL-2.0-or-later / LGPL-3.0-or-later
+git_at Vulkan-Headers https://github.com/KhronosGroup/Vulkan-Headers.git vulkan-sdk-1.4.363.0                       # Apache-2.0
+git_at Vulkan-Loader  https://github.com/KhronosGroup/Vulkan-Loader.git  fa218055ff4948b159f31d43f800c808a13d51df   # vulkan-sdk-1.4.363.0, Apache-2.0
 git_at llvm-project  https://github.com/llvm/llvm-project.git          ca7933e47d3a3451d81e72ac174dcb5aa28b59d1   # llvmorg-22.1.8 (arm64e llvmpipe JIT)
 git_at AdrenoMetal   https://github.com/UniXNU/AdrenoMetal.git      cc0a4e8e57d20f4a4698753c2530875f2b10c0ca   # MIT; only bridge/RustPacBoundary.c (arm64e PAC trampolines) is built
 mkdir -p "$ROOT/build"
