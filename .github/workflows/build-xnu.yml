@@ -284,39 +284,36 @@ jobs:
               raise SystemExit(f'Unsupported OS image header: {head[:64].hex()}')
           PY
 
-          # Build mkapfs on macOS (patch Linux-only <linux/fs.h> BLKGETSIZE64 to macOS <sys/disk.h> DKIOCGETBLOCKCOUNT)
+          # Build mkapfs on macOS. apfsprogs includes Linux-only <linux/types.h> (__u8/__le16/__be32...) and
+          # <linux/fs.h> (BLKGETSIZE64), so provide minimal compat headers. BLKGETSIZE64 is only used for block
+          # devices; here mkapfs always operates on a regular image file (size comes from fstat st_size).
           git clone -q https://github.com/linux-apfs/apfsprogs.git "$WORK/dvm/sources/apfsprogs"
           git -C "$WORK/dvm/sources/apfsprogs" checkout -q 1bd1c1c2140d13d1b6d2e03379316572bee70aa3
-
-          # macOS has no <linux/types.h>; apfsprogs only needs the endian typedefs from it
-          mkdir -p "$WORK/shim/linux"
-          cat > "$WORK/shim/linux/types.h" <<'EOF'
-          #ifndef _SHIM_LINUX_TYPES_H
-          #define _SHIM_LINUX_TYPES_H
+          COMPAT="$WORK/apfs-compat"
+          mkdir -p "$COMPAT/linux"
+          cat > "$COMPAT/linux/types.h" <<'EOF'
+          #ifndef _COMPAT_LINUX_TYPES_H
+          #define _COMPAT_LINUX_TYPES_H
           #include <stdint.h>
-          typedef uint8_t  __u8;
-          typedef uint16_t __u16;
-          typedef uint32_t __u32;
-          typedef uint64_t __u64;
-          typedef uint16_t __le16;
-          typedef uint32_t __le32;
-          typedef uint64_t __le64;
-          typedef uint16_t __be16;
-          typedef uint32_t __be32;
-          typedef uint64_t __be64;
+          typedef uint8_t  __u8;  typedef int8_t  __s8;
+          typedef uint16_t __u16; typedef int16_t __s16;
+          typedef uint32_t __u32; typedef int32_t __s32;
+          typedef uint64_t __u64; typedef int64_t __s64;
+          typedef __u16 __le16; typedef __u16 __be16;
+          typedef __u32 __le32; typedef __u32 __be32;
+          typedef __u64 __le64; typedef __u64 __be64;
           #endif
           EOF
-
-          python3 - "$WORK/dvm/sources/apfsprogs/mkapfs/mkapfs.c" <<'PY'
-          import pathlib, sys
-          p = pathlib.Path(sys.argv[1])
-          s = p.read_text()
-          s = s.replace('#include <linux/fs.h>', '#ifdef __APPLE__\n#include <sys/disk.h>\n#else\n#include <linux/fs.h>\n#endif')
-          s = s.replace('ioctl(fd, BLKGETSIZE64, &size)', '0')
-          p.write_text(s)
-          PY
-          
-          make -C "$WORK/dvm/sources/apfsprogs/mkapfs" CC=/usr/bin/clang CFLAGS="-O2 -Wall -I../include -I$WORK/shim"
+          cat > "$COMPAT/linux/fs.h" <<'EOF'
+          #ifndef _COMPAT_LINUX_FS_H
+          #define _COMPAT_LINUX_FS_H
+          #include <stdint.h>
+          #include <sys/ioctl.h>
+          #define BLKGETSIZE64 _IOR(0x12, 114, uint64_t)
+          #endif
+          EOF
+          make -C "$WORK/dvm/sources/apfsprogs/mkapfs" CC=/usr/bin/clang CFLAGS="-O2 -Wall -I$COMPAT"
+          ls -l "$WORK/dvm/sources/apfsprogs/mkapfs/mkapfs"
 
           # Patch apfs-add-volumes.py on macOS so it runs under sudo directly without Linux 'unshare -r'
           python3 - "$WORK/dvm/scripts/apfs-add-volumes.py" <<'PY'
