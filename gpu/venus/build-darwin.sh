@@ -10,7 +10,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 MESA=26.3.1
 ARCHS=${ARCHS:-arm64 arm64e}
 W=${W:-$HOME/w/venus-darwin}; OUT=${OUT:-$W/out}; mkdir -p "$W"; cd "$W"
-export PATH=$W/venv/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH=$W/venv/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
 # Mesa wants Python >= 3.10 (macOS ships 3.9): uv's own when there is uv, else Homebrew's
 if ! { [ -x venv/bin/meson ] && venv/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; }; then
   rm -rf venv
