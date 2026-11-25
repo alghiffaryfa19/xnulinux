@@ -78,34 +78,6 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Install Homebrew tools and Rust nightly
-        run: |
-          brew_prefix=$(brew --prefix)
-          if [ ! -e /opt/homebrew ] && [ "$brew_prefix" != "/opt/homebrew" ]; then
-            sudo mkdir -p /opt
-            sudo ln -s "$brew_prefix" /opt/homebrew
-          fi
-          brew tap blacktop/tap || true
-          brew install llvm lld llvm@22 lld@22 cmake ninja meson glslang shaderc spirv-tools bison pkgconf zstd python@3.13 blacktop/tap/ipsw
-          if command -v rustup >/dev/null 2>&1; then
-            rustup toolchain install nightly --component rust-src
-            rustup default nightly
-          else
-            RUSTUP_INIT_SKIP_PATH_CHECK=yes curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --component rust-src
-          fi
-          export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:$PATH"
-          rustup target add aarch64-apple-darwin || true
-          {
-            echo "$HOME/.cargo/bin"
-            echo "/opt/homebrew/opt/rustup/bin"
-            echo "/opt/homebrew/opt/llvm@22/bin"
-            echo "/opt/homebrew/opt/lld@22/bin"
-            echo "/opt/homebrew/opt/llvm/bin"
-            echo "/opt/homebrew/opt/bison/bin"
-            echo "/opt/homebrew/bin"
-          } >> "$GITHUB_PATH"
-          xcodebuild -version || xcrun --show-sdk-path
-
       - name: Restore LLVM arm64e cache
         id: llvm-cache
         if: ${{ inputs.build_gpu_bundle }}
@@ -129,8 +101,41 @@ jobs:
           path: |
             gpu/xnu-cpu-metal/dist
 
+      - name: Install Homebrew tools and Rust nightly
+        run: |
+          brew_prefix=$(brew --prefix)
+          if [ ! -e /opt/homebrew ] && [ "$brew_prefix" != "/opt/homebrew" ]; then
+            sudo mkdir -p /opt
+            sudo ln -s "$brew_prefix" /opt/homebrew
+          fi
+          brew tap blacktop/tap || true
+          if [ "${{ steps.gpu-cache.outputs.cache-hit }}" = "true" ] && [ -d "gpu/xnu-cpu-metal/dist/XnuCpuMetal.bundle" ]; then
+            echo "XnuCpuMetal.bundle restored from cache; installing only ipsw and zstd for disk creation"
+            brew install zstd blacktop/tap/ipsw
+          else
+            brew install llvm lld llvm@22 lld@22 cmake ninja meson glslang shaderc spirv-tools bison pkgconf zstd python@3.13 blacktop/tap/ipsw
+            if command -v rustup >/dev/null 2>&1; then
+              rustup toolchain install nightly --component rust-src
+              rustup default nightly
+            else
+              RUSTUP_INIT_SKIP_PATH_CHECK=yes curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --component rust-src
+            fi
+            export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:$PATH"
+            rustup target add aarch64-apple-darwin || true
+          fi
+          {
+            echo "$HOME/.cargo/bin"
+            echo "/opt/homebrew/opt/rustup/bin"
+            echo "/opt/homebrew/opt/llvm@22/bin"
+            echo "/opt/homebrew/opt/lld@22/bin"
+            echo "/opt/homebrew/opt/llvm/bin"
+            echo "/opt/homebrew/opt/bison/bin"
+            echo "/opt/homebrew/bin"
+          } >> "$GITHUB_PATH"
+          xcodebuild -version || xcrun --show-sdk-path
+
       - name: Build universal XnuCpuMetal.bundle (arm64 + arm64e)
-        if: ${{ inputs.build_gpu_bundle }}
+        if: ${{ inputs.build_gpu_bundle && steps.gpu-cache.outputs.cache-hit != 'true' }}
         run: |
           # 1. Build Turnip Adreno Darwin driver (libvulkan_freedreno.dylib) & Venus Darwin driver (libvulkan_virtio.dylib)
           bash gpu/turnip/build-darwin.sh
@@ -244,14 +249,12 @@ jobs:
           decrypt_aea "$OS_AEA" "$WORK/raw/os.dmg"
           df -h "$WORK"
 
-          # 4. Create GPT + APFS container disk image (mac.img) and populate System, Data, Preboot
+          # 4. Create sparse raw GPT + APFS container disk image (mac.img) and populate System, Data, Preboot
           IMG="$WORK/mac.img"
-          hdiutil create -size "${DISK_GB}g" -type UDIF -layout GPTSPUD -fs APFS -volname "Macintosh HD" "$WORK/base.dmg"
-          hdiutil convert "$WORK/base.dmg" -format UDTO -o "$WORK/base.cdr"
-          rm -f "$WORK/base.dmg"
-          mv "$WORK/base.cdr" "$IMG"
-
-          DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" | awk '/GUID_partition_scheme/{print $1}')
+          rm -f "$IMG"
+          python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_CREAT|os.O_TRUNC|os.O_WRONLY, 0o644); os.ftruncate(fd, int(sys.argv[2])*1024*1024*1024); os.close(fd)' "$IMG" "$DISK_GB"
+          DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" | awk 'NR==1{print $1}')
+          diskutil partitionDisk "$DEV" GPT APFS "Macintosh HD" 100%
           sleep 3
           CONTAINER=$(diskutil list "$DEV" | awk '/Apple_APFS/{print $NF; exit}')
           APFS_CONT=$(diskutil apfs list "$CONTAINER" | awk '/Container Reference/{print $NF; exit}')
