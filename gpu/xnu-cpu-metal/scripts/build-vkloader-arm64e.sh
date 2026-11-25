@@ -3,7 +3,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VK_HDR_DIR="$ROOT/build/vk-deps/vulkan-headers/1.4.363.0"
+VK_HDR_DIR="${VK_HDR_DIR:-$ROOT/build/vk-deps/vulkan-headers/1.4.363.0}"
+if [ ! -d "$VK_HDR_DIR/include/vulkan" ]; then
+  mkdir -p "$VK_HDR_DIR/include"
+  ln -sfn "$ROOT/src/mesa/include/vulkan" "$VK_HDR_DIR/include/vulkan"
+  ln -sfn "$ROOT/src/mesa/include/vk_video" "$VK_HDR_DIR/include/vk_video"
+fi
 BUNDLE_SYSCONFDIR="/Library/GPUBundles/XnuCpuMetal.bundle/Contents/Resources"
 
 export PATH="$ROOT/build/pyvenv/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"

@@ -12,7 +12,7 @@ export CC=/usr/bin/clang
 export CXX=/usr/bin/clang++
 export OBJC=/usr/bin/clang
 export OBJCXX=/usr/bin/clang++
-export PATH="$ROOT/build/pyvenv/bin:$ROOT/build/vk-deps/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$LLVM_BIN"
+export PATH="$LLVM_BIN:$ROOT/build/pyvenv/bin:$ROOT/build/vk-deps/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig"
 
 if [ ! -f "$BUILD_DIR/build.ninja" ]; then

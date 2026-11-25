@@ -42,13 +42,16 @@ static int quiet_line(const char *l, unsigned n)
 		if (!x_strncmp(l + k, "triggered unnest", 16)) return 1;
 	return 0;
 }
-/* XNU's CPUs: Linux CPUs 0 .. cpus-1 (XNU's CPU 0 is Linux CPU 0, where xnu.ko's loading task runs) */
+/* XNU's CPUs: Linux CPUs first_cpu .. first_cpu+cpus-1 (default first_cpu=4 so Linux CPU 0 keeps hardware IRQs) */
 #define XNU_MAX_CPUS 16
 static int cpus = 1;
 module_param(cpus, int, 0444);
+static int first_cpu = 4;
+module_param(first_cpu, int, 0444);
 static struct xnu_world worlds[XNU_MAX_CPUS];		/* worlds[0] is xnu_W's twin: see xnu_worlds */
 struct xnu_world *xnu_worlds[LINUX64_CPU_SLOTS];	/* by CPU slot (world.S finds its CPU's save area here) */
 static signed char linux_cpu_of_slot[LINUX64_CPU_SLOTS];
+static signed char xnu_cpu_of_slot[LINUX64_CPU_SLOTS];
 static unsigned long long cpu_mpidr[XNU_MAX_CPUS];
 static void *cpu_thread[XNU_MAX_CPUS];
 static volatile int cpu_running[XNU_MAX_CPUS];
@@ -197,10 +200,10 @@ struct boot_args_v2 {			/* pexpert/arm64/boot.h layout */
 static char *model = "VirtualMac2,1";	/* Apple's own virtual Mac's model identifier */
 module_param(model, charp, 0444);
 
-/* the compressor's limit is in VM pages: 6 GB either way */
+/* the compressor's limit is in VM pages: half of DRAM (or 6 GB when DRAM >= 12 GB) */
 static const char *cmdline = "debug=0x8 -v -noprogress serial=0 startup_debug=1";
-static const char *cmdline_4k = " vm_compression_limit=1572864";
-static const char *cmdline_16k = " vm_compression_limit=393216 linux64_vm16k=1";
+static const char *cmdline_4k = " vm_compression_limit=524288";
+static const char *cmdline_16k = " vm_compression_limit=131072 linux64_vm16k=1";
 /* vm16k=1 (the default): XNU's VM pages are 16 KB, as on a Mac, over the host's 4 KB translation granule (XNU's
  * PAGE_RATIO 4): a quarter of the page faults of 4 KB pages; vm16k=0 gives 4 KB VM pages */
 static int vm16k = 1;
@@ -666,7 +669,7 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		return 1;
 	}
 	if (call == LINUX64_CALL_CPU_START) {	/* start XNU's CPU of MPIDR a1 at linux64_cpu_entry(a2), asynchronously */
-		int c = linux_cpu_of_slot[LINUX64_CPU_SLOT(a1)];
+		int c = xnu_cpu_of_slot[LINUX64_CPU_SLOT(a1)];
 		/* its thread was made before XNU ran (an upcall runs with preemption off: no thread creation here) */
 		if (c <= 0 || c >= cpus || !cpu_thread[c] || !a2 || cpu_start_arg[c]) {
 			logkv("xnu: XNU asked to start a CPU it was not given, MPIDR", a1);
@@ -678,9 +681,9 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		return 0;
 	}
 	if (call == LINUX64_CALL_IPI) {		/* XNU's CPU of MPIDR a1 has an IPI pending: make it look */
-		int c = linux_cpu_of_slot[LINUX64_CPU_SLOT(a1)];
-		if (c >= 0)
-			fki_kick_cpu(c);
+		int lc = linux_cpu_of_slot[LINUX64_CPU_SLOT(a1)];
+		if (lc >= 0)
+			fki_kick_cpu(lc);
 		return 0;
 	}
 	if (call == LINUX64_CALL_KERNEL_TABLES)
@@ -709,21 +712,24 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 	 * XNU identifies its CPUs by MPIDR: its CPU 0 runs here, bound to Linux CPU 0; CPUs 1 .. cpus-1 are Linux's of the
 	 * same numbers, started when XNU asks (LINUX64_CALL_CPU_START). Their slots in the per-CPU arrays must differ.
 	 */
-	int berr = fki_bind_cpu(0);
-	if (berr) { logkv("xnu: cannot bind to cpu0, err", (u64_t)berr); return 0; }
+	if (first_cpu < 0 || first_cpu >= fki_num_cpus()) first_cpu = 0;
+	int berr = fki_bind_cpu(first_cpu);
+	if (berr) { logkv("xnu: cannot bind to first_cpu, err", (u64_t)berr); return 0; }
 	if (cpus < 1) cpus = 1;
 	if (cpus > XNU_MAX_CPUS) cpus = XNU_MAX_CPUS;
-	if (cpus > fki_num_cpus()) cpus = fki_num_cpus();
-	for (int i = 0; i < LINUX64_CPU_SLOTS; i++) linux_cpu_of_slot[i] = -1;
+	if (first_cpu + cpus > fki_num_cpus()) cpus = fki_num_cpus() - first_cpu;
+	for (int i = 0; i < LINUX64_CPU_SLOTS; i++) { linux_cpu_of_slot[i] = -1; xnu_cpu_of_slot[i] = -1; }
 	for (int c = 0; c < cpus; c++) {
+		int lc = first_cpu + c;
 		fki_u64 m = 0;
-		if (fki_cpu_mpidr(c, &m) || linux_cpu_of_slot[LINUX64_CPU_SLOT(m)] >= 0) {
-			logkv("xnu: no distinct MPIDR slot for Linux CPU, using CPUs below it:", (u64_t)c);
+		if (fki_cpu_mpidr(lc, &m) || linux_cpu_of_slot[LINUX64_CPU_SLOT(m)] >= 0) {
+			logkv("xnu: no distinct MPIDR slot for Linux CPU, using CPUs below it:", (u64_t)lc);
 			cpus = c;
 			break;
 		}
 		cpu_mpidr[c] = m & 0xffff;	/* XNU compares Aff1:Aff0 */
-		linux_cpu_of_slot[LINUX64_CPU_SLOT(m)] = (signed char)c;
+		linux_cpu_of_slot[LINUX64_CPU_SLOT(m)] = (signed char)lc;
+		xnu_cpu_of_slot[LINUX64_CPU_SLOT(m)] = (signed char)c;
 		xnu_worlds[LINUX64_CPU_SLOT(m)] = c ? &worlds[c] : &xnu_W;
 	}
 	u64_t mpidr = cpu_mpidr[0];
@@ -1098,7 +1104,7 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 	xnu_dbg = (const unsigned long *)macho_sym(&img, "_linux64_dbg");
 	xnu_el0_stat = (const unsigned long *)macho_sym(&img, "_linux64_el0_stat");
 	{	/* the helpers run where XNU does not: a CPU running XNU lets Linux in only at XNU's calls into the host */
-		int host_cpu = cpus < fki_num_cpus() ? cpus : fki_num_cpus() - 1;
+		int host_cpu = first_cpu > 0 ? 0 : (cpus < fki_num_cpus() ? cpus : fki_num_cpus() - 1);
 		if (monitor_cpu == -2)
 			monitor_cpu = host_cpu;
 		if (xnu_dbg && monitor_cpu >= 0)
@@ -1136,7 +1142,7 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 	if (cpus > 1 && !a_cpu_entry) { logs("xnu: kernel without linux64_cpu_entry: one CPU"); cpus = 1; }
 	for (int c = 1; c < cpus; c++) {	/* each secondary CPU's host thread, waiting for XNU to start that CPU */
 		cpu_start_arg[c] = 0;
-		cpu_thread[c] = fki_thread_start(cpu_fn, (void *)(unsigned long)c, c, "xnu-cpu");
+		cpu_thread[c] = fki_thread_start(cpu_fn, (void *)(unsigned long)c, first_cpu + c, "xnu-cpu");
 		if (!cpu_thread[c]) { logkv("xnu: cannot make a thread for CPU, running with CPUs below it:", (u64_t)c); cpus = c; }
 	}
 	logs("xnu: entering arm_init");
@@ -1145,7 +1151,7 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 	in_xnu = 0;
 	stop_run = 1;		/* the other CPUs end at their next call into the host (kicked out of idle) */
 	for (int c = 1; c < cpus; c++) {
-		for (int t = 0; cpu_running[c] && t < 500; t++) { fki_kick_cpu(c); fki_msleep(10); }
+		for (int t = 0; cpu_running[c] && t < 500; t++) { fki_kick_cpu(first_cpu + c); fki_msleep(10); }
 		if (cpu_running[c]) logkv("xnu: CPU did not leave XNU in 5 s:", (u64_t)c);
 		fki_thread_stop(cpu_thread[c]);
 		cpu_thread[c] = 0;

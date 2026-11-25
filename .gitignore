@@ -1,0 +1,25 @@
+# Build outputs and kernel module artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+*.order
+*.symvers
+.module-common.o
+
+# Local build workspaces and logs
+/w/
+/build/
+/*.log
+/sm8550.config
+/gpu/xnu-cpu-metal/src/metal2vulkan/
+/gpu/xnu-cpu-metal/src/Vulkan-Loader/
+/gpu/xnu-cpu-metal/src/llvm-project/
+/gpu/xnu-cpu-metal/src/AdrenoMetal/
+/gpu/xnu-cpu-metal/src/mesa/
+/gpu/xnu-cpu-metal/build/
+/gpu/xnu-cpu-metal/dist/
+/gpu/xnu-drm/xnudrmd
+/tools/xnu-hostcall

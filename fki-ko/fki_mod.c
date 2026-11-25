@@ -70,7 +70,9 @@ typedef struct page *(*alloc_contig_fn)(unsigned long nr_pages, gfp_t gfp, int n
 typedef void (*free_contig_fn)(unsigned long pfn, unsigned long nr_pages);
 static alloc_contig_fn p_alloc_contig;
 static free_contig_fn p_free_contig;
-struct cma;
+static int (*p_alloc_contig_range)(unsigned long start, unsigned long end, unsigned int alloc_flags, gfp_t gfp_mask);
+static phys_addr_t (*p_cma_get_base)(const struct cma *cma);
+static unsigned long (*p_cma_get_size)(const struct cma *cma);
 static struct cma **p_cma_area;	/* the default CMA area (cma= on the command line), if any */
 static struct page *(*p_cma_alloc)(struct cma *, unsigned long, unsigned int, bool);	/* not exported on every kernel */
 static bool (*p_cma_release)(struct cma *, const struct page *, unsigned long);
@@ -100,12 +102,50 @@ static int fki_resolve(void)
 	p_cma_area = (struct cma **)lookup("dma_contiguous_default_area");
 	p_cma_alloc = (void *)lookup("cma_alloc");
 	p_cma_release = (void *)lookup("cma_release");
+	p_cma_get_base = (void *)lookup("cma_get_base");
+	p_cma_get_size = (void *)lookup("cma_get_size");
+	p_alloc_contig_range = (void *)lookup("alloc_contig_range_noprof");
+	if (!p_alloc_contig_range)
+		p_alloc_contig_range = (void *)lookup("alloc_contig_range");
 	p_set_memory_nx = (set_memory_fn)lookup("set_memory_nx");
 	p_stext = lookup("_stext");
 	p_end = lookup("_end");
 	p_kimage_voffset = (u64 *)lookup("kimage_voffset");
 	p_efi_mem_type = (void *)lookup("efi_mem_type");
 	return p_set_memory_x && p_set_memory_nx ? 0 : -ENOENT;
+}
+
+static void fki_clear_gp(unsigned long va, unsigned long n)
+{
+	u64 ttbr1 = read_sysreg(ttbr1_el1) & GENMASK_ULL(47, 1);
+	u64 t1sz = (read_sysreg(tcr_el1) >> 16) & 0x3f;
+	unsigned long i;
+
+	for (i = 0; i < n; i++, va += PAGE_SIZE) {
+		u64 *tbl = phys_to_virt(ttbr1 & ~0xfffULL), e;
+
+		if (t1sz < 16) {
+			e = READ_ONCE(tbl[(va >> 48) & 15]);
+			if ((e & 3) != 3) continue;
+			tbl = phys_to_virt(e & GENMASK_ULL(47, 12));
+		}
+		e = READ_ONCE(tbl[(va >> 39) & 511]);
+		if ((e & 3) != 3) continue;
+		tbl = phys_to_virt(e & GENMASK_ULL(47, 12));
+		e = READ_ONCE(tbl[(va >> 30) & 511]);
+		if ((e & 3) != 3) continue;
+		tbl = phys_to_virt(e & GENMASK_ULL(47, 12));
+		e = READ_ONCE(tbl[(va >> 21) & 511]);
+		if ((e & 3) != 3) continue;
+		tbl = phys_to_virt(e & GENMASK_ULL(47, 12));
+		e = READ_ONCE(tbl[(va >> 12) & 511]);
+		if ((e & 3) == 3 && (e & PTE_GP))
+			WRITE_ONCE(tbl[(va >> 12) & 511], e & ~PTE_GP);
+	}
+	dsb(ishst);
+	__tlbi(vmalle1is);
+	dsb(ish);
+	isb();
 }
 
 int fki_region_alloc(unsigned long size, struct fki_region *r)
@@ -126,6 +166,7 @@ int fki_region_alloc(unsigned long size, struct fki_region *r)
 		vfree(va);
 		return err;
 	}
+	fki_clear_gp((unsigned long)va, n);
 	r->va = va;
 	r->pa = page_to_phys(vmalloc_to_page(va));
 	r->size = n << PAGE_SHIFT;
@@ -161,7 +202,7 @@ void fki_blob_put(void *handle)
 }
 EXPORT_SYMBOL(fki_blob_put);
 
-#define FKI_SCTLR_EN (SCTLR_ELx_ENIA | SCTLR_ELx_ENIB | SCTLR_ELx_ENDA | SCTLR_ELx_ENDB)
+#define FKI_SCTLR_EN (SCTLR_ELx_ENIA | SCTLR_ELx_ENIB | SCTLR_ELx_ENDA | SCTLR_ELx_ENDB | (1ULL << 36))
 
 
 static __always_inline void keys_read(struct fki_pac_keys *k)
@@ -181,7 +222,8 @@ static __always_inline void keys_write(const struct fki_pac_keys *k)
 	write_sysreg_s(k->da[0], SYS_APDAKEYLO_EL1); write_sysreg_s(k->da[1], SYS_APDAKEYHI_EL1);
 	write_sysreg_s(k->db[0], SYS_APDBKEYLO_EL1); write_sysreg_s(k->db[1], SYS_APDBKEYHI_EL1);
 	write_sysreg_s(k->ga[0], SYS_APGAKEYLO_EL1); write_sysreg_s(k->ga[1], SYS_APGAKEYHI_EL1);
-	sysreg_clear_set(sctlr_el1, FKI_SCTLR_EN, k->sctlr_en & FKI_SCTLR_EN);
+	/* Bit 36 is SCTLR_EL1.BT1: XNU is built without BTI landing pads, so clear BT1 when foreign keys (~0ULL) are loaded */
+	sysreg_clear_set(sctlr_el1, FKI_SCTLR_EN, (k->sctlr_en == ~0ULL ? (FKI_SCTLR_EN & ~(1ULL << 36)) : (k->sctlr_en & FKI_SCTLR_EN)));
 	isb();
 }
 
@@ -202,7 +244,7 @@ static void fki_fpsimd_forget(void)
 	kernel_neon_end(&scratch);
 }
 
-__attribute__((target("branch-protection=none"))) unsigned long fki_enter(const struct fki_pac_keys *foreign, struct fki_pac_keys *saved)
+__attribute__((target("branch-protection=bti"))) unsigned long fki_enter(const struct fki_pac_keys *foreign, struct fki_pac_keys *saved)
 {
 	unsigned long flags;
 
@@ -215,7 +257,7 @@ __attribute__((target("branch-protection=none"))) unsigned long fki_enter(const 
 }
 EXPORT_SYMBOL(fki_enter);
 
-__attribute__((target("branch-protection=none"))) void fki_leave(unsigned long cookie, const struct fki_pac_keys *saved)
+__attribute__((target("branch-protection=bti"))) void fki_leave(unsigned long cookie, const struct fki_pac_keys *saved)
 {
 	keys_write(saved);
 	local_irq_restore(cookie);
@@ -223,7 +265,7 @@ __attribute__((target("branch-protection=none"))) void fki_leave(unsigned long c
 }
 EXPORT_SYMBOL(fki_leave);
 
-__attribute__((target("branch-protection=none"))) void fki_pac_swap(const struct fki_pac_keys *load, struct fki_pac_keys *save)
+__attribute__((target("branch-protection=bti"))) void fki_pac_swap(const struct fki_pac_keys *load, struct fki_pac_keys *save)
 {
 	keys_read(save);
 	keys_write(load);
@@ -451,12 +493,18 @@ static bool resv_used, carve_used;
 static void fki_reserve(void)
 {
 	unsigned long cnt = ALIGN(reserve_mb << 20, SZ_2M) >> PAGE_SHIFT;
+	int try;
 
 	if (carve_mb)
 		pr_info("fki: %lu MiB at %#lx for the foreign kernel's DRAM (outside the host's memory)\n", carve_mb, carve_base);
 	if (!reserve_mb || fki_resolve() || !p_cma_area || !*p_cma_area || !p_cma_alloc)
 		return;
-	resv_pg = p_cma_alloc(*p_cma_area, cnt, get_order(SZ_2M), true);
+	for (try = 0; try < 5; try++) {
+		resv_pg = p_cma_alloc(*p_cma_area, cnt, get_order(SZ_2M), false);
+		if (resv_pg)
+			break;
+		msleep(50);
+	}
 	if (resv_pg)
 		resv_cnt = cnt;
 	pr_info("fki: %lu MiB for the foreign kernel's DRAM %s\n", reserve_mb, resv_pg ? "reserved" : "NOT reserved (CMA)");
@@ -553,7 +601,13 @@ int fki_contig_alloc(unsigned long size, struct fki_region *r)
 	 */
 	if (size >= (64UL << 20) && p_cma_area && *p_cma_area && p_cma_alloc && p_cma_release) {
 		unsigned long cnt = ALIGN(size, SZ_2M) >> PAGE_SHIFT;
-		pg = p_cma_alloc(*p_cma_area, cnt, get_order(SZ_2M), true);
+		int try;
+		for (try = 0; try < 5; try++) {
+			pg = p_cma_alloc(*p_cma_area, cnt, get_order(SZ_2M), false);
+			if (pg)
+				break;
+			msleep(50);
+		}
 		if (pg) {
 			r->va = page_address(pg);
 			memset(r->va, 0, cnt << PAGE_SHIFT);
@@ -565,9 +619,23 @@ int fki_contig_alloc(unsigned long size, struct fki_region *r)
 	}
 	if (!p_alloc_contig)
 		return -ENOENT;
-	while ((n << PAGE_SHIFT) < size)
-		n <<= 1;
-	pg = p_alloc_contig(n, GFP_KERNEL | __GFP_NOWARN, numa_node_id(), NULL);
+	n = ALIGN(size, SZ_2M) >> PAGE_SHIFT;
+	pg = p_alloc_contig(n, GFP_KERNEL | __GFP_MOVABLE | __GFP_RETRY_MAYFAIL | __GFP_NOWARN, numa_node_id(), NULL);
+	if (!pg)
+		pg = p_alloc_contig(n, GFP_KERNEL | __GFP_NOWARN, numa_node_id(), NULL);
+	if (!pg && p_alloc_contig_range && p_cma_area && *p_cma_area && p_cma_get_base && p_cma_get_size) {
+		unsigned long base_pfn = PHYS_PFN(p_cma_get_base(*p_cma_area));
+		unsigned long end_pfn = base_pfn + (p_cma_get_size(*p_cma_area) >> PAGE_SHIFT);
+		unsigned long step = SZ_2M >> PAGE_SHIFT;
+		unsigned long pfn;
+		for (pfn = ALIGN(base_pfn, step); pfn + n <= end_pfn; pfn += step) {
+			/* 0x1 = ACR_FLAGS_CMA (MIGRATE_CMA) */
+			if (p_alloc_contig_range(pfn, pfn + n, 0x1, GFP_KERNEL | __GFP_NOWARN) == 0) {
+				pg = pfn_to_page(pfn);
+				break;
+			}
+		}
+	}
 	if (!pg)
 		return -ENOMEM;
 	r->va = page_address(pg);
@@ -602,9 +670,17 @@ EXPORT_SYMBOL(fki_contig_free);
 int fki_window_l1(unsigned long va, unsigned long long **l1_va, fki_u64 *l1_pa)
 {
 	u64 ttbr1 = read_sysreg(ttbr1_el1) & GENMASK_ULL(47, 1);
-	u64 *l0 = phys_to_virt(ttbr1 & ~0xfffULL);
-	u64 e = READ_ONCE(l0[(va >> 39) & 511]);
+	u64 t1sz = (read_sysreg(tcr_el1) >> 16) & 0x3f;
+	u64 *tbl = phys_to_virt(ttbr1 & ~0xfffULL);
+	u64 e;
 
+	if (t1sz < 16) {	/* 52-bit VA (5-level, 4K granule): walk L-1 first */
+		e = READ_ONCE(tbl[(va >> 48) & 15]);
+		if ((e & 3) != 3)
+			return -ENOENT;
+		tbl = phys_to_virt(e & GENMASK_ULL(47, 12));
+	}
+	e = READ_ONCE(tbl[(va >> 39) & 511]);
 	if ((e & 3) != 3)
 		return -ENOENT;
 	*l1_pa = e & GENMASK_ULL(47, 12);
@@ -680,6 +756,7 @@ static void fki_linux_runs(void (*fn)(void *), void *arg)
 	unsigned long daif = read_sysreg(daif);
 	struct fki_runs r = { fn, arg };
 
+	write_sysreg(daif & ~0x300UL, daif);	/* Linux expects D and A unmasked across schedule/__switch_to */
 	fki_linux_runs_body(fki_runs_then_forget, &r);
 	write_sysreg(daif, daif);
 }
@@ -831,7 +908,7 @@ static struct sk_buff_head fki_net_rxq;	/* Linux -> foreign */
 
 static netdev_tx_t fki_net_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-	struct task_struct *t;
+	int cpu;
 
 	if (skb_queue_len(&fki_net_rxq) >= FKI_NET_QLEN) {
 		dev->stats.tx_dropped++;
@@ -841,9 +918,13 @@ static netdev_tx_t fki_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	dev->stats.tx_packets++;
 	dev->stats.tx_bytes += skb->len;
 	skb_queue_tail(&fki_net_rxq, skb);
-	t = READ_ONCE(fki_idle_task[0]);
-	if (t)
-		wake_up_process(t);	/* the foreign kernel's first CPU is idle: let it see the frame now */
+	for_each_possible_cpu(cpu) {
+		struct task_struct *t = READ_ONCE(fki_idle_task[cpu]);
+		if (t) {
+			wake_up_process(t);	/* wake the first idle foreign CPU */
+			break;
+		}
+	}
 	return NETDEV_TX_OK;
 }
 

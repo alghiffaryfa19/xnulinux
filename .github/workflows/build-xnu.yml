@@ -1,0 +1,448 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Build XnuCpuMetal.bundle (arm64 + arm64e universal), the macOS 27 APFS system disk (mac.img),
+# mac.conf (ROOT_UUID, BOOT_UUID), and trustcache-mac.bin on a macos-26 runner, plus optional
+# Linux arm64 kernel/kc.bin build, and publish split zstd assets to a GitHub Release.
+name: build-xnulinux
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos_runner:
+        description: "macOS runner for building XnuCpuMetal.bundle and mac.img (macos-26 has Xcode 26 and macOS 26/27 APFS tools)"
+        type: choice
+        options: ["macos-26", "macos-15", "macos-latest"]
+        default: "macos-26"
+      build_disk:
+        description: "Build the full macOS 27.2 (26B8125) APFS system disk (mac.img) + trustcache-mac.bin + mac.conf"
+        type: boolean
+        default: true
+      build_gpu_bundle:
+        description: "Build universal (arm64 + arm64e) XnuCpuMetal.bundle (Lavapipe + metal2vulkan + Venus)"
+        type: boolean
+        default: true
+      build_kernel:
+        description: "Also build kernel.macho and kc.bin on ubuntu-24.04-arm"
+        type: boolean
+        default: false
+      disk_size_gb:
+        description: "Logical size of the mac.img APFS disk in GB (sparse)"
+        type: string
+        default: "36"
+      publish_release:
+        description: "Publish built artifacts (including split mac.img.zst.part-*) to GitHub Releases"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-xnulinux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  IPSW_URL: "https://updates.cdn-apple.com/2026FallFCS/b83bb963-ebd8-4608-8b5d-fdc70cb24927/UniversalMac_27.2_26B8125_Restore.ipsw"
+
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
+
+jobs:
+  macos-disk-and-gpu:
+    if: ${{ inputs.build_disk || inputs.build_gpu_bundle }}
+    runs-on: ${{ inputs.macos_runner }}
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space on runner
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          rm -rf "$HOME/Library/Android" /Applications/Xcode_*.app 2>/dev/null || true
+          df -h "$GITHUB_WORKSPACE"
+
+      - uses: actions/checkout@v4
+
+      - name: Install Homebrew tools and Rust nightly
+        run: |
+          brew_prefix=$(brew --prefix)
+          if [ ! -e /opt/homebrew ] && [ "$brew_prefix" != "/opt/homebrew" ]; then
+            sudo mkdir -p /opt
+            sudo ln -s "$brew_prefix" /opt/homebrew
+          fi
+          brew tap blacktop/tap || true
+          brew install llvm lld llvm@22 lld@22 cmake ninja meson glslang shaderc spirv-tools bison pkgconf zstd python@3.13 blacktop/tap/ipsw
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --component rust-src
+          rustup target add aarch64-apple-darwin || true
+          {
+            echo "$HOME/.cargo/bin"
+            echo "/opt/homebrew/opt/llvm@22/bin"
+            echo "/opt/homebrew/opt/lld@22/bin"
+            echo "/opt/homebrew/opt/llvm/bin"
+            echo "/opt/homebrew/opt/bison/bin"
+            echo "/opt/homebrew/bin"
+          } >> "$GITHUB_PATH"
+          xcodebuild -version
+
+      - name: Restore GPU build cache
+        id: gpu-cache
+        if: ${{ inputs.build_gpu_bundle }}
+        uses: actions/cache/restore@v4
+        with:
+          key: xnulinux-gpu-v1-${{ runner.os }}-${{ hashFiles('gpu/xnu-cpu-metal/scripts/**', 'gpu/xnu-cpu-metal/patches/**') }}
+          restore-keys: |
+            xnulinux-gpu-v1-${{ runner.os }}-
+          path: |
+            gpu/xnu-cpu-metal/build/llvm-arm64e-install
+            gpu/xnu-cpu-metal/dist
+
+      - name: Build universal XnuCpuMetal.bundle (arm64 + arm64e)
+        if: ${{ inputs.build_gpu_bundle }}
+        run: |
+          # 1. Build Venus Darwin driver (libvulkan_virtio.dylib)
+          bash gpu/venus/build-darwin.sh
+          export VENUS_DYLIB="$HOME/w/venus-darwin/out/lib/libvulkan_virtio.dylib"
+
+          # 2. Prepare Python venv with Meson, Mako, PyYAML for Mesa Lavapipe
+          cd gpu/xnu-cpu-metal
+          mkdir -p build
+          if [ ! -x build/pyvenv/bin/meson ]; then
+            /opt/homebrew/bin/python3.13 -m venv build/pyvenv
+            build/pyvenv/bin/pip install -q meson ninja mako pyyaml packaging
+          fi
+
+          # 3. Fetch pinned upstream sources (metal2vulkan, Vulkan-Loader, llvm-project, AdrenoMetal, Mesa)
+          bash scripts/fetch-sources.sh
+
+          # 4. Build arm64e LLVM static libraries for llvmpipe JIT (cached across runs)
+          if [ ! -x build/llvm-arm64e-install/bin/llvm-config ]; then
+            bash scripts/build-llvm-arm64e.sh
+          fi
+
+          # 5. Build Vulkan Loader (arm64 + arm64e), Lavapipe (arm64 + arm64e), metal2vulkan bridge (arm64 + arm64e), and universal bundle
+          bash scripts/build-vkloader-arm64e.sh
+          bash scripts/build-lavapipe.sh
+          bash scripts/build-lavapipe-arm64e.sh
+          bash scripts/build-m2v.sh
+          bash scripts/build-m2v-arm64e.sh
+          bash scripts/build-bundle-universal.sh
+
+      - name: Save GPU build cache
+        if: ${{ inputs.build_gpu_bundle && steps.gpu-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          key: xnulinux-gpu-v1-${{ runner.os }}-${{ hashFiles('gpu/xnu-cpu-metal/scripts/**', 'gpu/xnu-cpu-metal/patches/**') }}
+          path: |
+            gpu/xnu-cpu-metal/build/llvm-arm64e-install
+            gpu/xnu-cpu-metal/dist
+
+      - name: Build macOS 27.2 APFS disk image (mac.img) from IPSW
+        if: ${{ inputs.build_disk }}
+        env:
+          DISK_GB: ${{ inputs.disk_size_gb }}
+        run: |
+          WORK="$RUNNER_TEMP/macdisk"
+          mkdir -p "$WORK"
+          git clone -q --depth 1 https://github.com/Droid-VM/macOS-DroidVM "$WORK/dvm"
+
+          # 1. Inventory IPSW and fetch only StaticTrustCache, Cryptex1,AppOS, Cryptex1,SystemOS, and OS via HTTP Range
+          pushd "$WORK/dvm"
+          python3 scripts/macos-inputs.py --profile configs/macos-27.2-26B8125.json --output "$WORK/inv"
+          for COMP in StaticTrustCache "Cryptex1,AppOS" "Cryptex1,SystemOS" OS; do
+            python3 scripts/macos-fetch-member.py "$COMP" \
+              --profile configs/macos-27.2-26B8125.json \
+              --inventory "$WORK/inv/identities.json" \
+              --identity k114sap \
+              --output-dir "$WORK/raw" \
+              --jobs 8
+          done
+          popd
+
+          # 2. Extract raw static trustcache module for xnu.ko trustcache=
+          python3 - "$WORK/raw"/*.dmg.aea.trustcache "$WORK/trustcache-mac.bin" <<'PY'
+          import struct, sys, glob
+          paths = glob.glob(sys.argv[1])
+          d = open(paths[0], 'rb').read()
+          i = d.find(b'trst')
+          if i < 0:
+              # IM4P without trst tag (Direct DER sequence)
+              j = d.find(b'\x04', 16)
+          else:
+              j = d.find(b'\x04', i + 7)
+          n = d[j + 1]
+          if n & 0x80:
+              k = n & 0x7f
+              length = int.from_bytes(d[j + 2:j + 2 + k], 'big'); start = j + 2 + k
+          else:
+              length = n; start = j + 2
+          payload = d[start:start + length]
+          version, count = struct.unpack_from('<I', payload, 0)[0], struct.unpack_from('<I', payload, 20)[0]
+          assert version in (1, 2), f'unexpected trustcache version {version}'
+          open(sys.argv[2], 'wb').write(payload)
+          print(f'trustcache v{version}: {count} entries, {len(payload)} bytes -> {sys.argv[2]}')
+          PY
+
+          # 3. Decrypt AEA-encrypted SystemOS and OS DMGs using ipsw
+          decrypt_aea() {
+            local enc="$1" out="$2"
+            local key
+            key=$(ipsw fw aea --key "$enc" | awk '{print $NF}')
+            mkdir -p "$WORK/aea-tmp"
+            ipsw fw aea -b "$key" -o "$WORK/aea-tmp" "$enc"
+            mv "$WORK/aea-tmp"/* "$out"
+            rmdir "$WORK/aea-tmp"
+            rm -f "$enc"
+          }
+          SYSOS_AEA=$(ls "$WORK/raw"/141-64957-*.dmg.aea)
+          OS_AEA=$(ls "$WORK/raw"/141-64992-*.dmg.aea)
+          APPOS_DMG=$(ls "$WORK/raw"/141-64745-*.dmg)
+
+          decrypt_aea "$SYSOS_AEA" "$WORK/raw/systemos.dmg"
+          decrypt_aea "$OS_AEA" "$WORK/raw/os.dmg"
+          df -h "$WORK"
+
+          # 4. Create GPT + APFS container disk image (mac.img) and populate System, Data, Preboot
+          IMG="$WORK/mac.img"
+          hdiutil create -size "${DISK_GB}g" -type UDIF -layout GPTSPUD -fs APFS -volname "Macintosh HD" "$WORK/base.dmg"
+          hdiutil convert "$WORK/base.dmg" -format UDTO -o "$WORK/base.cdr"
+          rm -f "$WORK/base.dmg"
+          mv "$WORK/base.cdr" "$IMG"
+
+          DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" | awk '/GUID_partition_scheme/{print $1}')
+          sleep 3
+          CONTAINER=$(diskutil list "$DEV" | awk '/Apple_APFS/{print $NF; exit}')
+          APFS_CONT=$(diskutil apfs list "$CONTAINER" | awk '/Container Reference/{print $NF; exit}')
+          SYS_DEV=$(diskutil list "$APFS_CONT" | awk '/Macintosh HD/{print $NF; exit}')
+
+          # Create volume group with Data, plus Preboot, VM, Update, Hardware, xART roles
+          diskutil apfs addVolume "$APFS_CONT" APFS "Data" -role D -groupWith "$SYS_DEV" -nomount
+          diskutil apfs addVolume "$APFS_CONT" APFS "Preboot" -role B -nomount
+          diskutil apfs addVolume "$APFS_CONT" APFS "VM" -role V -nomount
+          diskutil apfs addVolume "$APFS_CONT" APFS "Update" -role E -nomount
+          diskutil apfs addVolume "$APFS_CONT" APFS "Hardware" -role H -nomount
+          diskutil apfs addVolume "$APFS_CONT" APFS "xART" -role X -nomount
+
+          DATA_DEV=$(diskutil list "$APFS_CONT" | awk '/ Data /{print $NF; exit}')
+          PRE_DEV=$(diskutil list "$APFS_CONT" | awk '/ Preboot /{print $NF; exit}')
+
+          mkdir -p "$WORK/mnt/sys" "$WORK/mnt/data" "$WORK/mnt/preboot" "$WORK/mnt/os_src" "$WORK/mnt/sysos_src" "$WORK/mnt/appos_src"
+          sudo mount -t apfs -o rw,nobrowse "/dev/$SYS_DEV" "$WORK/mnt/sys"
+          sudo diskutil mount -mountPoint "$WORK/mnt/data" "$DATA_DEV"
+          sudo diskutil enableOwnership "$WORK/mnt/data"
+          sudo diskutil mount -mountPoint "$WORK/mnt/preboot" "$PRE_DEV"
+          sudo diskutil enableOwnership "$WORK/mnt/preboot"
+
+          # Attach IPSW OS.dmg, SystemOS.dmg, AppOS.dmg read-only and copy their trees
+          OS_SRC_DEV=$(hdiutil attach -readonly -nobrowse -mountpoint "$WORK/mnt/os_src" "$WORK/raw/os.dmg" | head -1 | awk '{print $1}')
+          echo "Copying base OS volume..."
+          sudo ditto "$WORK/mnt/os_src" "$WORK/mnt/sys"
+          hdiutil detach "$WORK/mnt/os_src" -force
+          rm -f "$WORK/raw/os.dmg"
+
+          echo "Merging Cryptex1,SystemOS into System volume and Preboot..."
+          hdiutil attach -readonly -nobrowse -mountpoint "$WORK/mnt/sysos_src" "$WORK/raw/systemos.dmg"
+          for d in usr/lib usr/libexec usr/bin usr/sbin usr/share System/iOSSupport; do
+            [ -d "$WORK/mnt/sysos_src/$d" ] && sudo mkdir -p "$WORK/mnt/sys/$d" && sudo cp -Rpn "$WORK/mnt/sysos_src/$d/." "$WORK/mnt/sys/$d/" 2>/dev/null || true
+          done
+          for e in "$WORK/mnt/sysos_src"/System/Library/*; do
+            n=$(basename "$e")
+            if [ -d "$e" ]; then
+              sudo mkdir -p "$WORK/mnt/sys/System/Library/$n"
+              sudo cp -Rpn "$e/." "$WORK/mnt/sys/System/Library/$n/" 2>/dev/null || true
+            else
+              sudo cp -pn "$e" "$WORK/mnt/sys/System/Library/" 2>/dev/null || true
+            fi
+          done
+          sudo mkdir -p "$WORK/mnt/preboot/Cryptexes" "$WORK/mnt/preboot/com.apple.security.cryptexd/Cryptexes"
+          sudo ln -sfn / "$WORK/mnt/preboot/Cryptexes/OS"
+          sudo mkdir -p "$WORK/mnt/sys/System/Volumes/Preboot/Cryptexes" "$WORK/mnt/sys/System/Volumes/Preboot/com.apple.security.cryptexd/Cryptexes"
+          sudo ln -sfn / "$WORK/mnt/sys/System/Volumes/Preboot/Cryptexes/OS"
+          hdiutil detach "$WORK/mnt/sysos_src" -force
+          rm -f "$WORK/raw/systemos.dmg"
+
+          echo "Copying Cryptex1,AppOS into Preboot/Cryptexes/App..."
+          hdiutil attach -readonly -nobrowse -mountpoint "$WORK/mnt/appos_src" "$APPOS_DMG"
+          sudo mkdir -p "$WORK/mnt/preboot/Cryptexes/App"
+          sudo ditto "$WORK/mnt/appos_src" "$WORK/mnt/preboot/Cryptexes/App"
+          hdiutil detach "$WORK/mnt/appos_src" -force
+          rm -f "$APPOS_DMG"
+
+          # 5. Populate Data volume from System's Data template + gui-user.py + XnuCpuMetal.bundle + launchd jobs
+          echo "Populating Data volume..."
+          D="$WORK/mnt/data"
+          sudo ditto "$WORK/mnt/sys/System/Library/Templates/Data" "$D"
+          for dir in tmp log run vm folders db/dslocal/nodes/Default; do
+            sudo mkdir -p "$D/private/var/$dir"
+          done
+          sudo mkdir -p "$D/private/tmp"
+          sudo chmod 1777 "$D/private/var/tmp" "$D/private/tmp"
+          sudo rm -f "$D"/private/var/keybags/* 2>/dev/null || true
+
+          sudo python3 tools/hosted/gui-user.py "$D" "$WORK/mnt/sys/System/Library/User Template"
+          sudo mkdir -p "$D/Library/GPUBundles" "$D/Library/LaunchDaemons" "$D/private/var/db/com.apple.xpc.launchd"
+          if [ -d "gpu/xnu-cpu-metal/dist/XnuCpuMetal.bundle" ]; then
+            sudo ditto "gpu/xnu-cpu-metal/dist/XnuCpuMetal.bundle" "$D/Library/GPUBundles/XnuCpuMetal.bundle"
+            sudo chown -R root:wheel "$D/Library/GPUBundles"
+          fi
+
+          DISABLE="com.apple.watchdogd com.apple.iomfb_bics_daemon com.apple.audiomxd com.apple.audio.coreaudiod com.apple.PerfPowerServices com.apple.PerfPowerServicesExtended com.apple.oahd com.apple.oahd-root-helper com.apple.apsd com.apple.AppSSODaemon com.apple.filesystems.fskitd com.apple.fairplayd"
+          sudo D="$D" DISABLE="$DISABLE" python3 - <<'PY'
+          import os, plistlib
+          D = os.environ["D"]
+          shell = {"Label": "xnulinux.shell", "ProgramArguments": ["/bin/bash", "-i"], "RunAtLoad": True,
+                   "StandardInPath": "/dev/console", "StandardOutPath": "/dev/console", "StandardErrorPath": "/dev/console",
+                   "EnvironmentVariables": {"HOME": "/var/root", "LOGNAME": "root", "USER": "root", "SHELL": "/bin/bash", "TERM": "dumb",
+                                            "PATH": "/bin:/usr/bin:/sbin:/usr/sbin", "PS1": "xnulinux# "}}
+          p = D + "/Library/LaunchDaemons/xnulinux.shell.plist"
+          plistlib.dump(shell, open(p, "wb")); os.chown(p, 0, 0); os.chmod(p, 0o644)
+          awake = {"Label": "xnulinux.awake", "RunAtLoad": True,
+                   "ProgramArguments": ["/usr/bin/pmset", "-a", "displaysleep", "0", "sleep", "0", "disksleep", "0"]}
+          p = D + "/Library/LaunchDaemons/xnulinux.awake.plist"
+          plistlib.dump(awake, open(p, "wb")); os.chown(p, 0, 0); os.chmod(p, 0o644)
+          nosaver = {"Label": "xnulinux.nosaver", "RunAtLoad": True, "LimitLoadToSessionType": "Aqua",
+                     "ProgramArguments": ["/usr/bin/defaults", "-currentHost", "write", "com.apple.screensaver", "idleTime", "-int", "0"]}
+          os.makedirs(D + "/Library/LaunchAgents", exist_ok=True)
+          p = D + "/Library/LaunchAgents/xnulinux.nosaver.plist"
+          plistlib.dump(nosaver, open(p, "wb")); os.chown(p, 0, 0); os.chmod(p, 0o644)
+          p = D + "/private/var/db/com.apple.xpc.launchd/disabled.plist"
+          disabled = plistlib.load(open(p, "rb")) if os.path.exists(p) else {}
+          disabled.update({label: True for label in os.environ["DISABLE"].split()})
+          plistlib.dump(disabled, open(p, "wb")); os.chown(p, 0, 0); os.chmod(p, 0o644)
+          os.makedirs(D + "/Library/Preferences", exist_ok=True)
+          p = D + "/Library/Preferences/com.apple.keyboardtype.plist"
+          plistlib.dump({"keyboardtype": {"22529-4617-0": 40}}, open(p, "wb")); os.chown(p, 0, 0); os.chmod(p, 0o644)
+          os.makedirs(D + "/private/etc", exist_ok=True)
+          p = D + "/private/etc/sysctl.conf"
+          open(p, "w").write("kern.memorystatus_highwater_enabled=0\n"); os.chown(p, 0, 0); os.chmod(p, 0o644)
+          PY
+
+          ROOT_UUID=$(diskutil info "$SYS_DEV" | awk -F': *' '/Volume UUID/{print $2; exit}')
+          GROUP_UUID=$(diskutil info "$DATA_DEV" | awk -F': *' '/Volume UUID/{print $2; exit}')
+          sudo mkdir -p "$WORK/mnt/preboot/$GROUP_UUID"
+          {
+            echo "ROOT_UUID=$ROOT_UUID"
+            echo "BOOT_UUID=$GROUP_UUID"
+            echo "MACOS=27.2"
+          } > "$WORK/mac.conf"
+          cat "$WORK/mac.conf"
+
+          sync
+          sudo umount "$WORK/mnt/sys"
+          sudo diskutil unmount force "$WORK/mnt/data"
+          sudo diskutil unmount force "$WORK/mnt/preboot"
+          hdiutil detach "$DEV" -force
+
+          # 6. Compress sparse mac.img with zstd --sparse
+          mkdir -p artifacts
+          cp "$WORK/mac.conf" "$WORK/trustcache-mac.bin" artifacts/
+          if [ -d "gpu/xnu-cpu-metal/dist/XnuCpuMetal.bundle" ]; then
+            tar -C gpu/xnu-cpu-metal/dist -czf artifacts/XnuCpuMetal.bundle.tar.gz XnuCpuMetal.bundle
+          fi
+          zstd -T0 -3 --sparse "$IMG" -o artifacts/mac.img.zst
+          rm -f "$IMG"
+          ls -lh artifacts/
+
+      - name: Stage GPU bundle artifact (when build_disk is false)
+        if: ${{ inputs.build_gpu_bundle && !inputs.build_disk }}
+        run: |
+          mkdir -p artifacts
+          tar -C gpu/xnu-cpu-metal/dist -czf artifacts/XnuCpuMetal.bundle.tar.gz XnuCpuMetal.bundle
+          ls -lh artifacts/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xnulinux-macos27-assets
+          path: artifacts/*
+          compression-level: 0
+          retention-days: 7
+
+      - name: Publish to GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="macos-27.2-latest"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "xnulinux macOS 27.2 (26B8125) Latest Build" \
+              --notes $'Automated macOS 27.2 (26B8125) APFS disk & GPU bundle build.\n\nReassemble `mac.img` on the Linux host:\n```sh\ncat mac.img.zst.part-* | zstd -d --sparse -o /var/tmp/mac.img\ncp mac.conf /var/tmp/mac.conf\nsudo cp trustcache-mac.bin /lib/firmware/xnu/trustcache-mac.bin\n```' \
+              --prerelease || true
+          fi
+          mkdir -p release-assets
+          for f in artifacts/*; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            if [ "$base" = "mac.img.zst" ]; then
+              split -b 1900m "$f" "release-assets/mac.img.zst.part-"
+            else
+              cp "$f" "release-assets/$base"
+            fi
+          done
+          if ls release-assets/mac.img.zst.part-* >/dev/null 2>&1; then
+            for old_asset in $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name | select(startswith("mac.img.zst.part-"))' || true); do
+              gh release delete-asset "$TAG" "$old_asset" --repo "$GITHUB_REPOSITORY" --yes || true
+            done
+          fi
+          ls -lh release-assets/
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber release-assets/*
+          rm -rf release-assets
+
+  kernel-and-kc:
+    if: ${{ inputs.build_kernel }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space and prepare /mnt workspace
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
+          sudo mkdir -p /mnt/w && sudo chown "$(id -u):$(id -g)" /mnt/w
+          ln -sfn /mnt/w "$HOME/w"
+          df -h / /mnt
+
+      - uses: actions/checkout@v4
+
+      - name: Fetch IPSW KernelCache and TrustCache via macOS-DroidVM
+        run: |
+          W="$HOME/w" bash scripts/vm-xnu-build.sh
+          cd "$HOME/w/dvm"
+          mkdir -p toolchains/ipsw
+          curl -sSL https://github.com/blacktop/ipsw/releases/download/v3.1.749/ipsw_3.1.749_linux_arm64.tar.gz | tar -C toolchains/ipsw -xzf - ipsw
+          chmod +x toolchains/ipsw/ipsw
+          export IPSW="$PWD/toolchains/ipsw/ipsw"
+          python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path('configs/product-k27.json')
+          cfg = json.loads(p.read_text())
+          for src in cfg['inputs']['ipsws']:
+              src['members'] = [m for m in src['members'] if 'TrustCache' in m['component'] or m['component'] in ('KernelCache', 'DeviceTree')]
+          p.write_text(json.dumps(cfg, indent=1))
+          PY
+          python3 scripts/product.py inputs
+          ls -lh out/kc/kc27.bin artifacts/27.2/boot/kernel.macho.trustcache
+
+      - name: Apply LINUX64 patches and build kc.bin + kernel.macho
+        run: |
+          sudo mkdir -p /lib/firmware/xnu
+          W="$HOME/w" bash scripts/vm-xnu-rebuild.sh
+          python3 - <<'PY'
+          import struct, pathlib
+          tc_bundle = pathlib.Path.home() / 'w/dvm/artifacts/27.2/boot/kernel.macho.trustcache'
+          data = tc_bundle.read_bytes()
+          count, off0 = struct.unpack_from('<II', data, 0)
+          off1 = struct.unpack_from('<I', data, 8)[0] if count > 1 else len(data)
+          mod0 = data[off0:off1]
+          pathlib.Path('/tmp/trustcache-mac.bin').write_bytes(mod0)
+          print(f'Extracted raw trustcache module: {len(mod0)} bytes')
+          PY
+          mkdir -p /mnt/w/out-artifacts
+          cp /home/runner/w/dvm/out/k27/kernel-k27.macho /mnt/w/out-artifacts/kernel.macho
+          cp /home/runner/w/dvm/out/k27/kc-k27.bin /mnt/w/out-artifacts/kc.bin
+          cp /tmp/trustcache-mac.bin /mnt/w/out-artifacts/
+          ls -lh /mnt/w/out-artifacts/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xnulinux-firmware-arm64
+          path: /mnt/w/out-artifacts/*
+          retention-days: 14

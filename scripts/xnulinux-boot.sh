@@ -34,7 +34,7 @@ fi
 WAIT=0; [ "${1:-}" = --wait ] && WAIT=1
 [ -f /etc/xnulinux.conf ] && . /etc/xnulinux.conf
 [ -f /var/tmp/mac.conf ] && . /var/tmp/mac.conf
-DISK=${DISK:-/var/tmp/mac.img}; RAM_MB=${RAM_MB:-7900}; GPU=${GPU:-auto}; CPUS=${CPUS:-1}
+DISK=${DISK:-/var/tmp/mac.img}; RAM_MB=${RAM_MB:-3500}; GPU=${GPU:-off}; CPUS=${CPUS:-4}
 CONSOLE_IN=${CONSOLE_IN:-/var/tmp/console-in}; INPUT_IN=${INPUT_IN:-/var/tmp/xnu-input}; FB_DUMP=${FB_DUMP:-/var/tmp/xnu-fb.raw}
 KEYSTORE=${KEYSTORE:-/var/tmp/xnu-keystore.bin}; TRUSTCACHE=${TRUSTCACHE:-xnu/trustcache-mac.bin}; IMAGE=${IMAGE:-xnu/kc.bin}
 BOOTARGS=${BOOTARGS:-amfi_get_out_of_my_way=1 lp-sip0=2050}
@@ -43,7 +43,7 @@ lsmod | grep -q '^xnu ' && { echo "xnu.ko is loaded: a hosted system is running 
 
 K=/lib/modules/$(uname -r)/build
 build() {	# a module; its compiler errors on failure
-  local log; log=$(make -s -C "$K" M="$PWD/$1" ${2:-} modules 2>&1) || { echo "$log" | grep -E "error|Error" | head -20 >&2; exit 1; }
+  local log; log=$(make -s LLVM=1 -C "$K" M="$PWD/$1" ${2:-} modules 2>&1) || { echo "$log" | grep -E "error|Error" | head -20 >&2; exit 1; }
 }
 build fki-ko
 build xnu-ko "KBUILD_EXTRA_SYMBOLS=$PWD/fki-ko/Module.symvers"
@@ -51,15 +51,19 @@ build xnu-ko "KBUILD_EXTRA_SYMBOLS=$PWD/fki-ko/Module.symvers"
 # VM console, where a CPU printing waits for the console with interrupts off
 sudo dmesg -n "${CONLEVEL:-1}"
 # fki has the hosted kernel's DRAM from its load at boot (scripts/vm-install-fki-service.sh): reload it only when it changed,
-# with the same carve-out
-CARVE="carve_base=$(cat /sys/module/fki/parameters/carve_base 2>/dev/null || echo 0x200000000) carve_mb=$(cat /sys/module/fki/parameters/carve_mb 2>/dev/null || echo 8156)"
+# with the same carve-out / CMA reservation
+CARVE_BASE_CUR=$(cat /sys/module/fki/parameters/carve_base 2>/dev/null || echo 0)
+CARVE_MB_CUR=$(cat /sys/module/fki/parameters/carve_mb 2>/dev/null || echo 0)
+RESERVE_MB_CUR=$(cat /sys/module/fki/parameters/reserve_mb 2>/dev/null || echo "${RESERVE_MB:-3600}")
+CARVE="carve_base=$CARVE_BASE_CUR carve_mb=$CARVE_MB_CUR reserve_mb=$RESERVE_MB_CUR"
 if [ "$(cat /sys/module/fki/srcversion 2>/dev/null)" != "$(modinfo -F srcversion fki-ko/fki.ko)" ]; then
   sudo systemctl stop xnudrmd 2>/dev/null || true	# it holds fki's /dev/xnu-hostcall
   sudo rmmod fki 2>/dev/null || true
   sudo insmod fki-ko/fki.ko $CARVE ${FKI_ARGS:-}
 fi
-[ "$(cat /sys/module/fki/parameters/carve_mb 2>/dev/null)" != 0 ] ||
-  echo "fki has no carve-out (scripts/vm-install-fki-service.sh): the allocation from CMA may fail" >&2
+if [ "$(cat /sys/module/fki/parameters/carve_mb 2>/dev/null || echo 0)" = 0 ] && [ "$(cat /sys/module/fki/parameters/reserve_mb 2>/dev/null || echo 0)" = 0 ]; then
+  echo "fki has no carve-out or reserve_mb: allocation will fall back to live CMA / alloc_contig_pages" >&2
+fi
 bash scripts/vm-net-up.sh
 
 # the hosted system's files on the host: console and input queues, the framebuffer xnu.ko writes, the keystore
@@ -72,8 +76,9 @@ rm -f "$KEYSTORE"; truncate -s 1M "$KEYSTORE"	# fresh each boot, as the disk was
 # until it next calls the host, so a disk completion routed there waits that long, and with several XNU CPUs one waiting
 # for another's I/O can wait for good (as a hypervisor keeps device interrupts off its vCPUs' cores).
 NCPU=$(nproc --all)
+FIRST_CPU=${FIRST_CPU:-4}
 if [ "$NCPU" -gt "$CPUS" ]; then
-  MASK=$(python3 -c "print(format(((1 << $NCPU) - 1) & ~((1 << $CPUS) - 1), 'x'))")
+  MASK=$(python3 -c "print(format(((1 << $NCPU) - 1) & ~(((1 << $CPUS) - 1) << $FIRST_CPU), 'x'))")
   echo "$MASK" | sudo tee /proc/irq/default_smp_affinity >/dev/null 2>&1 || true
   for f in /proc/irq/*/smp_affinity; do echo "$MASK" | sudo tee "$f" >/dev/null 2>&1 || true; done
 fi

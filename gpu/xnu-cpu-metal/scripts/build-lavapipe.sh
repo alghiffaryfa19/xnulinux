@@ -11,7 +11,7 @@ export CC=/usr/bin/clang
 export CXX=/usr/bin/clang++
 export OBJC=/usr/bin/clang
 export OBJCXX=/usr/bin/clang++
-export PATH="$ROOT/build/pyvenv/bin:$ROOT/build/vk-deps/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/opt/llvm@22/bin"
+export PATH="$ROOT/build/pyvenv/bin:$ROOT/build/vk-deps/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/opt/llvm@22/bin:/opt/homebrew/opt/llvm/bin"
 export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig"
 
 mkdir -p "$ROOT/build/static-libs"

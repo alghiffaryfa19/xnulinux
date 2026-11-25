@@ -11,10 +11,10 @@ U=$(id -un)
 [ -f /etc/xnulinux.conf ] || sudo tee /etc/xnulinux.conf >/dev/null <<'CONF'
 # The hosted macOS (scripts/xnulinux-boot.sh reads this, then /var/tmp/mac.conf for the disk's UUIDs); the environment
 # overrides what is written as ${NAME:-default}
-CPUS=${CPUS:-2}		# its CPUs (the Linux CPUs from 0 up; Linux keeps the rest and its device interrupts)
-RAM_MB=${RAM_MB:-7900}	# its memory, within fki's carve-out
+CPUS=${CPUS:-4}		# its CPUs (the Linux CPUs from 0 up; Linux keeps the rest and its device interrupts)
+RAM_MB=${RAM_MB:-3500}	# its memory, within fki's CMA reservation / carve-out (tuned for 8 GB Xiaomi Pad 6S Pro)
 #DISK=/var/tmp/mac.img
-GPU=${GPU:-auto}	# auto: the host GPU when the VM has a render node; off: CPU rendering only
+GPU=${GPU:-off}		# auto: virtio-gpu render node; off: CPU rendering (Mesa lavapipe) on Adreno/SM8550
 #XNU_ARGS="model=VirtualMac2,1"
 #BOOTARGS="amfi_get_out_of_my_way=1 lp-sip0=2050"
 CONF
