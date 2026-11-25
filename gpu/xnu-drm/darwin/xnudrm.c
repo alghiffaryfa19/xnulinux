@@ -677,19 +677,19 @@ int drmIoctl(int fd, unsigned long request, void *arg)
 
 int drmCommandRead(int fd, unsigned long drmCommandIndex, void *data, unsigned long size)
 {
-	unsigned long req = DRM_IOC(DRM_IOC_READ, DRM_IOCTL_BASE, DRM_COMMAND_BASE + drmCommandIndex, size);
+	unsigned long req = _IOC(IOC_OUT, DRM_IOCTL_BASE, DRM_COMMAND_BASE + drmCommandIndex, size);
 	return drmIoctl(fd, req, data) ? -errno : 0;
 }
 
 int drmCommandWrite(int fd, unsigned long drmCommandIndex, void *data, unsigned long size)
 {
-	unsigned long req = DRM_IOC(DRM_IOC_WRITE, DRM_IOCTL_BASE, DRM_COMMAND_BASE + drmCommandIndex, size);
+	unsigned long req = _IOC(IOC_IN, DRM_IOCTL_BASE, DRM_COMMAND_BASE + drmCommandIndex, size);
 	return drmIoctl(fd, req, data) ? -errno : 0;
 }
 
 int drmCommandWriteRead(int fd, unsigned long drmCommandIndex, void *data, unsigned long size)
 {
-	unsigned long req = DRM_IOC(DRM_IOC_READ | DRM_IOC_WRITE, DRM_IOCTL_BASE, DRM_COMMAND_BASE + drmCommandIndex, size);
+	unsigned long req = _IOC(IOC_INOUT, DRM_IOCTL_BASE, DRM_COMMAND_BASE + drmCommandIndex, size);
 	return drmIoctl(fd, req, data) ? -errno : 0;
 }
 
@@ -857,6 +857,8 @@ int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point,
 }
 
 /* ---- mappings: mmap(node fd, offset) after DRM_IOCTL_VIRTGPU_MAP or MSM_INFO_GET_OFFSET ---- */
+
+int xnudrm_munmap(void *addr, size_t len);
 
 /*
  * VIRTGPU_MAP's / MSM_INFO_GET_OFFSET's offset is the GEM handle's mmap cookie on Linux; xnudrmd maps by handle,

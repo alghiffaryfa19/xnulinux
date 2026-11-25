@@ -66,10 +66,29 @@ VK_EXT_map_memory_placed is disabled because XnuDrm maps Linux GEM pages at kern
  
     /* VK_EXT_multi_draw */
     features->multiDraw = true;
+@@ -3231,12 +3241,14 @@
+                                  "pthread condattr init");
+       goto fail_timeline_cond;
+    }
++#ifndef __APPLE__
+    if (pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+                                  VK_ERROR_INITIALIZATION_FAILED,
+                                  "pthread condattr clock setup");
+       goto fail_timeline_cond;
+    }
++#endif
+    if (pthread_cond_init(&device->timeline_cond, &condattr) != 0) {
+       pthread_condattr_destroy(&condattr);
 --- a/src/freedreno/vulkan/tu_knl.cc
 +++ b/src/freedreno/vulkan/tu_knl.cc
-@@ -15,6 +15,9 @@
- #ifdef MAJOR_IN_SYSMACROS
+@@ -12,8 +12,11 @@
+ #ifdef MAJOR_IN_MKDEV
+ #include <sys/mkdev.h>
+ #endif
+-#ifdef MAJOR_IN_SYSMACROS
++#if defined(MAJOR_IN_SYSMACROS) && !defined(__APPLE__)
  #include <sys/sysmacros.h>
  #endif
 +#ifdef __APPLE__
@@ -77,4 +96,3 @@ VK_EXT_map_memory_placed is disabled because XnuDrm maps Linux GEM pages at kern
 +#endif
  
  #include <sys/mman.h>
- 
