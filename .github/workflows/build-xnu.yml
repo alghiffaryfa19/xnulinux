@@ -58,7 +58,22 @@ jobs:
       - name: Free disk space on runner
         run: |
           df -h "$GITHUB_WORKSPACE"
-          rm -rf "$HOME/Library/Android" /Applications/Xcode_*.app 2>/dev/null || true
+          ACTIVE_DEV=$(xcode-select -p 2>/dev/null || true)
+          ACTIVE_XCODE="${ACTIVE_DEV%%/Contents/Developer}"
+          if [ ! -d "$ACTIVE_XCODE" ] || [[ "$ACTIVE_XCODE" != /Applications/Xcode*.app ]]; then
+            ACTIVE_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n1 || true)
+            if [ -n "$ACTIVE_XCODE" ]; then
+              sudo xcode-select -s "$ACTIVE_XCODE/Contents/Developer"
+            fi
+          fi
+          echo "Keeping active Xcode: $ACTIVE_XCODE"
+          for app in /Applications/Xcode_*.app; do
+            [ -e "$app" ] || continue
+            if [ "$app" != "$ACTIVE_XCODE" ]; then
+              sudo rm -rf "$app" || true
+            fi
+          done
+          rm -rf "$HOME/Library/Android" 2>/dev/null || true
           df -h "$GITHUB_WORKSPACE"
 
       - uses: actions/checkout@v4
@@ -72,17 +87,24 @@ jobs:
           fi
           brew tap blacktop/tap || true
           brew install llvm lld llvm@22 lld@22 cmake ninja meson glslang shaderc spirv-tools bison pkgconf zstd python@3.13 blacktop/tap/ipsw
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --component rust-src
+          if command -v rustup >/dev/null 2>&1; then
+            rustup toolchain install nightly --component rust-src
+            rustup default nightly
+          else
+            RUSTUP_INIT_SKIP_PATH_CHECK=yes curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --component rust-src
+          fi
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:$PATH"
           rustup target add aarch64-apple-darwin || true
           {
             echo "$HOME/.cargo/bin"
+            echo "/opt/homebrew/opt/rustup/bin"
             echo "/opt/homebrew/opt/llvm@22/bin"
             echo "/opt/homebrew/opt/lld@22/bin"
             echo "/opt/homebrew/opt/llvm/bin"
             echo "/opt/homebrew/opt/bison/bin"
             echo "/opt/homebrew/bin"
           } >> "$GITHUB_PATH"
-          xcodebuild -version
+          xcodebuild -version || xcrun --show-sdk-path
 
       - name: Restore GPU build cache
         id: gpu-cache
