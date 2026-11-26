@@ -332,6 +332,10 @@ jobs:
 
           GROW_BYTES=$(python3 -c "print((int('$DISK_GB') * 1024 * 1024 * 1024) - (64 * 1024 * 1024))")
           sudo python3 "$WORK/dvm/scripts/apfs-add-volumes.py" info "$WORK/apfs.raw"
+          # grow_container() mmaps the file at its current size and writes the grown space manager / chunks past the old end,
+          # so the file must already be (sparsely) extended to the target size (grow-data-store.py: "truncate it first").
+          python3 -c "import os,sys; os.truncate(sys.argv[1], int(sys.argv[2]))" "$WORK/apfs.raw" "$GROW_BYTES"
+          ls -lh "$WORK/apfs.raw"
           sudo python3 "$WORK/dvm/scripts/apfs-add-volumes.py" add "$WORK/apfs.raw" \
             --grow-to "$GROW_BYTES" \
             --group-with 0 \
