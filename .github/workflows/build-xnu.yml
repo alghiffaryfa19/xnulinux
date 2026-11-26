@@ -312,6 +312,29 @@ jobs:
           #define BLKGETSIZE64 _IOR(0x12, 114, uint64_t)
           #endif
           EOF
+          # mkapfs reads random UUIDs from Linux-only /proc/sys/kernel/random/uuid (always, for the container UUID even with -u);
+          # on macOS generate an RFC 4122 v4 UUID with arc4random_buf instead.
+          python3 - "$WORK/dvm/sources/apfsprogs/mkapfs/mkapfs.c" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          anchor = '\t/* Linux provides randomly generated UUIDs at /proc */\n'
+          assert anchor in s, 'get_random_uuid anchor not found'
+          s = s.replace(anchor, (
+              '#ifdef __APPLE__\n'
+              '\t{\n'
+              '\t\tunsigned char b[16];\n'
+              '\t\tarc4random_buf(b, sizeof(b));\n'
+              '\t\tb[6] = (b[6] & 0x0f) | 0x40;\n'
+              '\t\tb[8] = (b[8] & 0x3f) | 0x80;\n'
+              '\t\tsnprintf(uuid, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",\n'
+              '\t\t\t b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);\n'
+              '\t\t(void)ret;\n'
+              '\t\treturn uuid;\n'
+              '\t}\n'
+              '#endif\n' + anchor), 1)
+          p.write_text(s)
+          PY
           make -C "$WORK/dvm/sources/apfsprogs/mkapfs" CC=/usr/bin/clang CFLAGS="-O2 -Wall -I$COMPAT"
           ls -l "$WORK/dvm/sources/apfsprogs/mkapfs/mkapfs"
 
