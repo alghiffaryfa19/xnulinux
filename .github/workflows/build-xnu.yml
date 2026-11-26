@@ -419,13 +419,37 @@ jobs:
               /APFS Physical Store/ && $0 ~ ps { print c; exit }
             ')
           fi
-          diskutil unmountDisk "$APFS_CONT" >/dev/null 2>&1 || true
-          SYS_DEV=$(diskutil list "$APFS_CONT" | awk '/Macintosh HD/{print $NF; exit}')
-          DATA_DEV=$(diskutil list "$APFS_CONT" | awk '/APFS Volume Data /{print $NF; exit}')
-          [ -n "$DATA_DEV" ] || DATA_DEV=$(diskutil list "$APFS_CONT" | awk '/ Data /{print $NF; exit}')
-          PRE_DEV=$(diskutil list "$APFS_CONT" | awk '/APFS Volume Preboot /{print $NF; exit}')
-          [ -n "$PRE_DEV" ] || PRE_DEV=$(diskutil list "$APFS_CONT" | awk '/ Preboot /{print $NF; exit}')
+          # Resolve volume device nodes by APFS role from `diskutil apfs list -plist` (text scraping of `diskutil list`
+          # is fragile, esp. for an Apple_APFS_ISC container); retry while diskarbitrationd is still probing the volumes.
+          find_vols() {
+            diskutil apfs list -plist "$APFS_CONT" 2>/dev/null | python3 -c '
+          import plistlib, sys
+          try:
+              d = plistlib.loads(sys.stdin.buffer.read())
+          except Exception:
+              sys.exit(0)
+          found = {}
+          for c in d.get("Containers", []):
+              for v in c.get("Volumes", []):
+                  for r in v.get("Roles", []):
+                      found.setdefault(r, v.get("DeviceIdentifier", ""))
+          print(found.get("System", ""), found.get("Data", ""), found.get("Preboot", ""))
+          '
+          }
+          SYS_DEV=; DATA_DEV=; PRE_DEV=
+          for i in $(seq 1 30); do
+            read -r SYS_DEV DATA_DEV PRE_DEV < <(find_vols) || true
+            [ -n "$SYS_DEV" ] && [ -n "$DATA_DEV" ] && [ -n "$PRE_DEV" ] && break
+            sleep 2
+          done
           echo "APFS volumes on $APFS_CONT: System=$SYS_DEV Data=$DATA_DEV Preboot=$PRE_DEV"
+          if [ -z "$SYS_DEV" ] || [ -z "$DATA_DEV" ] || [ -z "$PRE_DEV" ]; then
+            diskutil list "$DEV" || true
+            diskutil apfs list "$APFS_CONT" || true
+            echo "::error::could not resolve System/Data/Preboot volumes on $APFS_CONT"
+            exit 1
+          fi
+          diskutil unmountDisk "$APFS_CONT" >/dev/null 2>&1 || true
 
           mkdir -p "$WORK/mnt/sys" "$WORK/mnt/data" "$WORK/mnt/preboot" "$WORK/mnt/sysos_src" "$WORK/mnt/appos_src"
           sudo mount -t apfs -o rw,nobrowse "/dev/$SYS_DEV" "$WORK/mnt/sys"
