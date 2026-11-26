@@ -315,6 +315,14 @@ jobs:
           make -C "$WORK/dvm/sources/apfsprogs/mkapfs" CC=/usr/bin/clang CFLAGS="-O2 -Wall -I$COMPAT"
           ls -l "$WORK/dvm/sources/apfsprogs/mkapfs/mkapfs"
 
+          # grow-data-store.py (imported by apfs-add-volumes.py) does a top-level `import packed_ramdisk` from the
+          # UniXNU/DarwinBoot submodule, which the shallow DroidVM clone lacks. Fetch just that stdlib-only file at the
+          # DarwinBoot commit pinned by UniXNU b2242fe (configs/env.lock.json).
+          PR_DIR="$WORK/dvm/sources/UniXNU/drivers/DarwinBoot/Test"
+          mkdir -p "$PR_DIR"
+          curl -fsSL https://raw.githubusercontent.com/UniXNU/DarwinBoot/85332b317ee80898fc78939ea64e6ca52d3837a3/Test/packed_ramdisk.py \
+            -o "$PR_DIR/packed_ramdisk.py"
+
           # Patch apfs-add-volumes.py on macOS so it runs under sudo directly without Linux 'unshare -r'
           python3 - "$WORK/dvm/scripts/apfs-add-volumes.py" <<'PY'
           import pathlib, sys
